@@ -1,0 +1,55 @@
+name: Build iOS SmartBlanketPro IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-ios-ipa:
+    name: Compile SwiftUI App & Package IPA (macOS Cloud Runner)
+    runs-on: macos-15
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Install XcodeGen & Generate .xcodeproj
+        run: |
+          if ! command -v xcodegen &> /dev/null; then
+            brew install xcodegen
+          fi
+          xcodegen generate
+          ls -la SmartBlanketPro.xcodeproj
+
+      - name: 3. Build Release .app via xcodebuild (Unsigned for AltStore / SideStore / Sideloadly)
+        run: |
+          xcodebuild clean build \
+            -project SmartBlanketPro.xcodeproj \
+            -scheme SmartBlanketPro \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: 4. Package Payload into SmartBlanketPro.ipa
+        run: |
+          APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -name "SmartBlanketPro.app" -type d | head -n 1)
+          echo "Found compiled app at: $APP_PATH"
+          mkdir -p "$RUNNER_TEMP/ipa_build/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/ipa_build/Payload/SmartBlanketPro.app"
+          cd "$RUNNER_TEMP/ipa_build"
+          zip -qry "$GITHUB_WORKSPACE/SmartBlanketPro-Unsigned.ipa" Payload
+          ls -lh "$GITHUB_WORKSPACE/SmartBlanketPro-Unsigned.ipa"
+
+      - name: 5. Upload Compiled IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartBlanketPro-iOS-IPA
+          path: SmartBlanketPro-Unsigned.ipa
+          retention-days: 30
