@@ -202,7 +202,10 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             }
 
         case .inactive:
-            break
+            let activeSnap = activeDevice
+            Task { @MainActor in
+                await LiveActivityManager.shared.handleAppEnteredBackground(activeDevice: activeSnap)
+            }
         @unknown default:
             break
         }
