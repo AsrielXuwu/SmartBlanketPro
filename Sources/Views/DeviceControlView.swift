@@ -37,6 +37,16 @@ public struct DeviceControlView: View {
         device.mode == .miteRemoval
     }
 
+    /// 自动关机定时禁用条件：除螨模式中，或关机状态下已设定预约开机时间
+    private var isAutoOffDisabled: Bool {
+        isMiteRemovalActive || (!device.isOn && device.timeOpenHours > 0)
+    }
+
+    /// 预约开机禁用条件：除螨模式中，或设备已处于开机状态
+    private var isScheduleOnDisabled: Bool {
+        isMiteRemovalActive || device.isOn
+    }
+
     private var dominantGearColor: Color {
         LiquidGlassTheme.gearColor(
             for: max(device.gearLeft, device.gearRight),
@@ -203,6 +213,8 @@ public struct DeviceControlView: View {
                         .sensoryFeedback(.selection, trigger: device.timeCloseHours)
                     }
                     .frame(maxWidth: .infinity)
+                    .disabled(isAutoOffDisabled)
+                    .opacity(isAutoOffDisabled ? 0.45 : 1.0)
 
                     Divider()
                         .frame(height: 96)
@@ -249,10 +261,10 @@ public struct DeviceControlView: View {
                         .sensoryFeedback(.selection, trigger: device.timeOpenHours)
                     }
                     .frame(maxWidth: .infinity)
+                    .disabled(isScheduleOnDisabled)
+                    .opacity(isScheduleOnDisabled ? 0.45 : 1.0)
                 }
                 .padding(.vertical, 4)
-                .disabled(isMiteRemovalActive)
-                .opacity(isMiteRemovalActive ? 0.45 : 1.0)
             } header: {
                 Text("定时关机与预约开机")
             } footer: {
@@ -387,8 +399,8 @@ public struct DeviceControlView: View {
         .onReceive(clockTimer) { now in
             currentTime = now
         }
-        .onChange(of: isMiteRemovalActive) { _, active in
-            if active && showingScheduleOnPopover {
+        .onChange(of: isScheduleOnDisabled) { _, disabled in
+            if disabled && showingScheduleOnPopover {
                 showingScheduleOnPopover = false
             }
         }
@@ -518,8 +530,8 @@ public struct DeviceControlView: View {
                         : .regular.interactive(),
                     in: .capsule
                 )
-                .disabled(isMiteRemovalActive)
-                .opacity(isMiteRemovalActive ? 0.45 : 1.0)
+                .disabled(isScheduleOnDisabled)
+                .opacity(isScheduleOnDisabled ? 0.45 : 1.0)
                 .popover(
                     isPresented: $showingScheduleOnPopover,
                     attachmentAnchor: .rect(.bounds),
@@ -809,8 +821,8 @@ public struct DeviceControlView: View {
                 }
             }
             .frame(maxWidth: .infinity)
-            .disabled(isMiteRemovalActive)
-            .opacity(isMiteRemovalActive ? 0.45 : 1.0)
+            .disabled(isAutoOffDisabled)
+            .opacity(isAutoOffDisabled ? 0.45 : 1.0)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)

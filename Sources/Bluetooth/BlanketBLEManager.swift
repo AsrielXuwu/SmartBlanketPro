@@ -915,11 +915,10 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
     }
 
-    /// 2. 调节左温区挡位 (1~9)
+    /// 2. 调节左温区挡位 (1~9) — 关机状态下仅在 App 本地记忆，不会同时开机或下发蓝牙指令
     public func setGearLeft(_ gear: Int, for deviceID: UUID, debounced: Bool = true) {
         guard let idx = devices.firstIndex(where: { $0.id == deviceID }),
               devices[idx].mode != .miteRemoval else { return }
-        recordGearRuntimeSlice(for: deviceID)
         let clamped = min(9, max(1, gear))
         devices[idx].gearLeft = clamped
         devices[idx].savedGearLeft = clamped
@@ -929,23 +928,11 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             devices[idx].savedGearRight = clamped
         }
 
-        let needsPowerOn = !devices[idx].isOn
-        if needsPowerOn {
-            let now = Date()
-            devices[idx].isOn = true
-            if devices[idx].currentSessionStartDate == nil {
-                devices[idx].currentSessionStartDate = now
-                devices[idx].totalPowerOnCount += 1
-            }
-            lastGearAccountingDates[deviceID] = now
-        }
+        guard devices[idx].isOn else { return }
+        recordGearRuntimeSlice(for: deviceID)
 
         let taskAction: @Sendable () async -> Void = { [weak self] in
             guard let self = self else { return }
-            if needsPowerOn {
-                await self.sendCommand(BlanketProtocol.cmdPower(isOn: true), to: deviceID)
-                try? await Task.sleep(nanoseconds: 350_000_000)
-            }
             await self.sendCommand(BlanketProtocol.cmdGearLeft(clamped), to: deviceID)
             if shouldSyncRight {
                 try? await Task.sleep(nanoseconds: 200_000_000)
@@ -963,11 +950,10 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
     }
 
-    /// 3. 调节右温区挡位 (1~9)
+    /// 3. 调节右温区挡位 (1~9) — 关机状态下仅在 App 本地记忆，不会同时开机或下发蓝牙指令
     public func setGearRight(_ gear: Int, for deviceID: UUID, debounced: Bool = true) {
         guard let idx = devices.firstIndex(where: { $0.id == deviceID }),
               devices[idx].mode != .miteRemoval else { return }
-        recordGearRuntimeSlice(for: deviceID)
         let clamped = min(9, max(1, gear))
         devices[idx].gearRight = clamped
         devices[idx].savedGearRight = clamped
@@ -977,23 +963,11 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             devices[idx].savedGearLeft = clamped
         }
 
-        let needsPowerOn = !devices[idx].isOn
-        if needsPowerOn {
-            let now = Date()
-            devices[idx].isOn = true
-            if devices[idx].currentSessionStartDate == nil {
-                devices[idx].currentSessionStartDate = now
-                devices[idx].totalPowerOnCount += 1
-            }
-            lastGearAccountingDates[deviceID] = now
-        }
+        guard devices[idx].isOn else { return }
+        recordGearRuntimeSlice(for: deviceID)
 
         let taskAction: @Sendable () async -> Void = { [weak self] in
             guard let self = self else { return }
-            if needsPowerOn {
-                await self.sendCommand(BlanketProtocol.cmdPower(isOn: true), to: deviceID)
-                try? await Task.sleep(nanoseconds: 350_000_000)
-            }
             await self.sendCommand(BlanketProtocol.cmdGearRight(clamped), to: deviceID)
             if shouldSyncLeft {
                 try? await Task.sleep(nanoseconds: 200_000_000)
@@ -1052,26 +1026,30 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
     }
 
-    /// 5. 设置自动关机定时 (1~12 小时)
+    /// 5. 设置自动关机定时 (1~12 小时) — 关机状态下仅在 App 本地记忆，已选预约开机时不可调节
     @MainActor
     public func setAutoOffHours(_ hours: Int, for deviceID: UUID) async {
         guard let idx = devices.firstIndex(where: { $0.id == deviceID }),
-              devices[idx].mode != .miteRemoval else { return }
+              devices[idx].mode != .miteRemoval,
+              devices[idx].isOn || devices[idx].timeOpenHours == 0 else { return }
         let clamped = min(12, max(1, hours))
         devices[idx].timeCloseHours = clamped
         devices[idx].savedTimeCloseHours = clamped
         devices[idx].remainingTimeCloseSec = clamped * 3600
+
+        guard devices[idx].isOn else { return }
         let snapshot = devices[idx]
 
         PushNotificationManager.shared.scheduleBackgroundHardwareTimerNotifications(for: snapshot)
         await runTimerCommandBLEPipeline(cmdHex: BlanketProtocol.cmdTimeClose(hours: clamped), deviceID: deviceID)
     }
 
-    /// 6. 设置预约开机定时 (0~12 小时，0 为关闭预约)
+    /// 6. 设置预约开机定时 (0~12 小时，0 为关闭预约) — 仅在设备关机且非除螨模式下可用
     @MainActor
     public func setScheduledOnHours(_ hours: Int, for deviceID: UUID) async {
         guard let idx = devices.firstIndex(where: { $0.id == deviceID }),
-              devices[idx].mode != .miteRemoval else { return }
+              devices[idx].mode != .miteRemoval,
+              !devices[idx].isOn else { return }
         let clamped = min(12, max(0, hours))
         devices[idx].timeOpenHours = clamped
         devices[idx].remainingTimeOpenSec = clamped * 3600
