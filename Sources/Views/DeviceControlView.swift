@@ -254,6 +254,7 @@ public struct DeviceControlView: View {
             }
         }
         .listStyle(.insetGrouped)
+        .animation(morphAnimation, value: device)
         .navigationTitle(device.name)
         .navigationBarTitleDisplayMode(.large)
         .toolbar {
@@ -559,10 +560,8 @@ public struct DeviceControlView: View {
             HStack(spacing: 10) {
                 // 1. 主电源液态玻璃醒目按钮 (.buttonStyle(.glassProminent))
                 Button {
-                    withAnimation(morphAnimation) {
-                        Task { @MainActor in
-                            await bleManager.setPower(isOn: !device.isOn, for: deviceID)
-                        }
+                    Task { @MainActor in
+                        await bleManager.setPower(isOn: !device.isOn, for: deviceID)
                     }
                 } label: {
                     Label(
@@ -580,10 +579,8 @@ public struct DeviceControlView: View {
                 // 2. 一键除螨 / 普通加热切换液态玻璃按钮 (.buttonStyle(.glass))
                 Button {
                     let nextMode: BlanketHeatingMode = (device.mode == .miteRemoval) ? .normal : .miteRemoval
-                    withAnimation(morphAnimation) {
-                        Task { @MainActor in
-                            await bleManager.setMode(nextMode, for: deviceID)
-                        }
+                    Task { @MainActor in
+                        await bleManager.setMode(nextMode, for: deviceID)
                     }
                 } label: {
                     Label(
@@ -594,7 +591,7 @@ public struct DeviceControlView: View {
                     .padding(.vertical, 4)
                 }
                 .buttonStyle(.glass)
-                .tint(device.mode == .miteRemoval ? .red : .primary)
+                .tint(device.mode == .miteRemoval ? Color.red : Color.primary)
 
                 // 3. 一键切换双区同步液态玻璃圆钮 (.buttonStyle(.glass))
                 if let idx = deviceIndex {
