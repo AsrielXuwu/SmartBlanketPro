@@ -33,6 +33,10 @@ public struct DeviceControlView: View {
         bleManager.connectionPhase(for: deviceID)
     }
 
+    private var isMiteRemovalActive: Bool {
+        device.mode == .miteRemoval
+    }
+
     private var dominantGearColor: Color {
         LiquidGlassTheme.gearColor(
             for: max(device.gearLeft, device.gearRight),
@@ -247,10 +251,14 @@ public struct DeviceControlView: View {
                     .frame(maxWidth: .infinity)
                 }
                 .padding(.vertical, 4)
+                .disabled(isMiteRemovalActive)
+                .opacity(isMiteRemovalActive ? 0.45 : 1.0)
             } header: {
                 Text("定时关机与预约开机")
             } footer: {
-                Text(device.isOn ? device.formattedRemainingCloseTime : device.formattedRemainingOpenTime)
+                Text(isMiteRemovalActive
+                     ? "除螨模式已锁定 9 挡 (45°C) 运行 2 小时，期间不可调节挡位与定时。"
+                     : (device.isOn ? device.formattedRemainingCloseTime : device.formattedRemainingOpenTime))
             }
 
             // MARK: 5. 实时开启小时数与连接快照 Section (Requirement 5)
@@ -379,6 +387,11 @@ public struct DeviceControlView: View {
         .onReceive(clockTimer) { now in
             currentTime = now
         }
+        .onChange(of: isMiteRemovalActive) { _, active in
+            if active && showingScheduleOnPopover {
+                showingScheduleOnPopover = false
+            }
+        }
     }
 
     // MARK: - 顶部双温区拨轮卡片 + 顶部快捷关机定时大卡片 + 独立无粘连状态胶囊（支持点击预约状态原位展开拨轮小菜单）
@@ -505,6 +518,8 @@ public struct DeviceControlView: View {
                         : .regular.interactive(),
                     in: .capsule
                 )
+                .disabled(isMiteRemovalActive)
+                .opacity(isMiteRemovalActive ? 0.45 : 1.0)
                 .popover(
                     isPresented: $showingScheduleOnPopover,
                     attachmentAnchor: .rect(.bounds),
@@ -636,6 +651,8 @@ public struct DeviceControlView: View {
             .pickerStyle(.wheel)
             .frame(height: 96)
             .clipped()
+            .disabled(isMiteRemovalActive)
+            .opacity(isMiteRemovalActive ? 0.45 : 1.0)
             .sensoryFeedback(.selection, trigger: gear)
 
             HStack {
@@ -719,6 +736,8 @@ public struct DeviceControlView: View {
                 .pickerStyle(.wheel)
                 .frame(width: 120, height: 96)
                 .clipped()
+                .disabled(isMiteRemovalActive)
+                .opacity(isMiteRemovalActive ? 0.45 : 1.0)
                 .sensoryFeedback(.selection, trigger: device.gearLeft)
             }
         }
@@ -790,6 +809,8 @@ public struct DeviceControlView: View {
                 }
             }
             .frame(maxWidth: .infinity)
+            .disabled(isMiteRemovalActive)
+            .opacity(isMiteRemovalActive ? 0.45 : 1.0)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
@@ -824,6 +845,7 @@ public struct DeviceControlView: View {
                     .contentTransition(.numericText())
             }
 
+            Group {
             HStack(spacing: 12) {
                 Button {
                     guard gear > 1 else { return }
@@ -902,6 +924,9 @@ public struct DeviceControlView: View {
                 }
                 .frame(maxWidth: .infinity)
             }
+            }
+            .disabled(isMiteRemovalActive)
+            .opacity(isMiteRemovalActive ? 0.45 : 1.0)
         }
         .padding(.vertical, 6)
     }

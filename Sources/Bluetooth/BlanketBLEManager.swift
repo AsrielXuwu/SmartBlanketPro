@@ -917,7 +917,8 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
 
     /// 2. 调节左温区挡位 (1~9)
     public func setGearLeft(_ gear: Int, for deviceID: UUID, debounced: Bool = true) {
-        guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return }
+        guard let idx = devices.firstIndex(where: { $0.id == deviceID }),
+              devices[idx].mode != .miteRemoval else { return }
         recordGearRuntimeSlice(for: deviceID)
         let clamped = min(9, max(1, gear))
         devices[idx].gearLeft = clamped
@@ -964,7 +965,8 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
 
     /// 3. 调节右温区挡位 (1~9)
     public func setGearRight(_ gear: Int, for deviceID: UUID, debounced: Bool = true) {
-        guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return }
+        guard let idx = devices.firstIndex(where: { $0.id == deviceID }),
+              devices[idx].mode != .miteRemoval else { return }
         recordGearRuntimeSlice(for: deviceID)
         let clamped = min(9, max(1, gear))
         devices[idx].gearRight = clamped
@@ -1053,7 +1055,8 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
     /// 5. 设置自动关机定时 (1~12 小时)
     @MainActor
     public func setAutoOffHours(_ hours: Int, for deviceID: UUID) async {
-        guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return }
+        guard let idx = devices.firstIndex(where: { $0.id == deviceID }),
+              devices[idx].mode != .miteRemoval else { return }
         let clamped = min(12, max(1, hours))
         devices[idx].timeCloseHours = clamped
         devices[idx].savedTimeCloseHours = clamped
@@ -1067,7 +1070,8 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
     /// 6. 设置预约开机定时 (0~12 小时，0 为关闭预约)
     @MainActor
     public func setScheduledOnHours(_ hours: Int, for deviceID: UUID) async {
-        guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return }
+        guard let idx = devices.firstIndex(where: { $0.id == deviceID }),
+              devices[idx].mode != .miteRemoval else { return }
         let clamped = min(12, max(0, hours))
         devices[idx].timeOpenHours = clamped
         devices[idx].remainingTimeOpenSec = clamped * 3600
@@ -1264,7 +1268,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
 
     @MainActor
     private func applyParsedTLVToUI(
-        _ tlv: BlanketProtocol.ParsedTLV,
+        _ tlv: BlanketTLVUpdate,
         measuredLatency: Int?,
         now: Date,
         needDelayedQueryForGear: Bool,

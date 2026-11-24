@@ -320,7 +320,8 @@ public struct BlanketLiveActivityWidget: Widget {
                         .background(Color.primary.opacity(0.10), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .disabled(gear >= 9)
+                .disabled(isMiteRemoval || gear >= 9)
+                .opacity(isMiteRemoval ? 0.4 : 1.0)
 
                 Button(intent: BlanketLiveStepGearIntent(deviceID: deviceID, zone: zone, delta: -1)) {
                     Image(systemName: "chevron.down")
@@ -329,7 +330,8 @@ public struct BlanketLiveActivityWidget: Widget {
                         .background(Color.primary.opacity(0.10), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .disabled(gear <= 1)
+                .disabled(isMiteRemoval || gear <= 1)
+                .opacity(isMiteRemoval ? 0.4 : 1.0)
             }
         }
         .padding(.horizontal, 12)
@@ -359,7 +361,8 @@ public struct BlanketLiveActivityWidget: Widget {
                     .background(Color.white.opacity(0.16), in: Circle())
             }
             .buttonStyle(.plain)
-            .disabled(gear <= 1)
+            .disabled(isMiteRemoval || gear <= 1)
+                .opacity(isMiteRemoval ? 0.4 : 1.0)
 
             VStack(spacing: 0) {
                 Text(title)
@@ -379,7 +382,8 @@ public struct BlanketLiveActivityWidget: Widget {
                     .background(Color.white.opacity(0.16), in: Circle())
             }
             .buttonStyle(.plain)
-            .disabled(gear >= 9)
+            .disabled(isMiteRemoval || gear >= 9)
+                .opacity(isMiteRemoval ? 0.4 : 1.0)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
