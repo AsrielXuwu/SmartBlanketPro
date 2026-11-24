@@ -480,11 +480,11 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
             }
             let dayRecords = usageRecords.filter { $0.endDate >= dayStart && $0.endDate < dayEnd }
             var daySec = dayRecords.reduce(0.0) { $0 + $1.durationSeconds }
-            var domGear = dayRecords.last?.primaryGear ?? max(gearLeft, gearRight)
+            var domGear = (dayRecords.last?.mode == .miteRemoval) ? 9 : (dayRecords.last?.primaryGear ?? max(gearLeft, gearRight))
 
             if offset == 0 && isOn {
                 daySec += Double(currentSessionElapsedSeconds(at: now))
-                domGear = max(gearLeft, gearRight)
+                domGear = (mode == .miteRemoval) ? 9 : max(gearLeft, gearRight)
             }
 
             let rawLabel = formatter.string(from: dayStart).replacingOccurrences(of: "周", with: "")

@@ -135,6 +135,8 @@ public struct DeviceControlView: View {
                     }
                 }
                 .pickerStyle(.segmented)
+                .disabled(!device.isOn)
+                .opacity(device.isOn ? 1.0 : 0.45)
                 .sensoryFeedback(.selection, trigger: device.mode)
 
                 Toggle(
@@ -370,7 +372,7 @@ public struct DeviceControlView: View {
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     Task { @MainActor in
-                        await bleManager.queryStatus(for: deviceID)
+                        await bleManager.queryStatus(for: deviceID, userInitiated: true)
                     }
                 } label: {
                     Label("同步状态", systemImage: "arrow.clockwise")
@@ -1010,6 +1012,8 @@ private struct ControlFloatingDockView: View {
             .buttonStyle(.glass)
             .buttonBorderShape(.capsule)
             .tint((device.isOn && device.mode == .miteRemoval) ? Color.red : Color.primary)
+            .disabled(!device.isOn)
+            .opacity(device.isOn ? 1.0 : 0.45)
             .accessibilityLabel("切换除螨模式")
 
             // 3. 一键切换双区同步液态玻璃圆钮

@@ -71,7 +71,9 @@ public struct BlanketLiveStepGearIntent: LiveActivityIntent {
     public func perform() async throws -> some IntentResult {
         #if !WIDGET_EXTENSION
         guard let targetUUID = UUID(uuidString: deviceIDString),
-              let device = BlanketBLEManager.shared.devices.first(where: { $0.id == targetUUID }) else {
+              let device = BlanketBLEManager.shared.devices.first(where: { $0.id == targetUUID }),
+              device.isOn,
+              device.mode != .miteRemoval else {
             return .result()
         }
 

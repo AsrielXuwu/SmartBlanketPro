@@ -29,6 +29,10 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
     @Published public var bluetoothState: CBManagerState = .unknown
     @Published public var onlyFilterJingHeDevices: Bool = true
     @Published public var lastBannerMessage: String?
+    /// 蓝牙自动直连连续失败超过上限时的弹窗提示文案
+    @Published public var connectionFailureAlertMessage: String?
+    /// 单轮自动重连最大尝试次数（超过后暂停自动重连并弹窗提示，直到从后台切回、冷启动、手动点击开关机或右上角刷新）
+    public static let maxAutoConnectAttempts = 3
 
     /// 切入后台时是否立即断开蓝牙连接（默认开启）
     @Published public var disconnectWhenEnteringBackground: Bool = (UserDefaults.standard.object(forKey: "com.smartblanketpro.bg_disconnect") as? Bool) ?? true {
@@ -70,6 +74,8 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
     private var lastReportedRSSI: [UUID: Int] = [:]
     private var lastLatencyReport: [UUID: (ms: Int, date: Date)] = [:]
     private var lastBLEProcessedSyncDates: [UUID: Date] = [:]
+    private var bleConsecutiveConnectFailures: [UUID: Int] = [:]
+    private var bleAutoConnectHalted: Set<UUID> = []
 
     // MARK: - Main-Thread Lifecycle & Persistence Tracking
     private var debounceTasks: [String: Task<Void, Never>] = [:]
@@ -215,7 +221,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             activateBluetoothIfNeeded()
             if let activeID = activeDeviceID {
                 Task.detached(priority: .userInitiated) { [weak self] in
-                    await self?.ensureConnected(deviceID: activeID)
+                    await self?.ensureConnected(deviceID: activeID, userInitiated: true)
                 }
             }
 
@@ -356,7 +362,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         if let lastTick = lastGearAccountingDates[deviceID] {
             let delta = max(0, now.timeIntervalSince(lastTick))
             if delta >= 1.0 && delta <= 12 * 3600 {
-                let domGear = min(9, max(1, max(devices[idx].gearLeft, devices[idx].gearRight)))
+                let domGear = (devices[idx].mode == .miteRemoval) ? 9 : min(9, max(1, max(devices[idx].gearLeft, devices[idx].gearRight)))
                 devices[idx].gearUsageSeconds[domGear, default: 0] += delta
             }
         }
@@ -378,7 +384,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             let elapsed = max(0, endDate.timeIntervalSince(start))
             if elapsed >= 5 {
                 devices[idx].accumulatedRuntimeSeconds += elapsed
-                let domGear = min(9, max(1, max(devices[idx].gearLeft, devices[idx].gearRight)))
+                let domGear = (devices[idx].mode == .miteRemoval) ? 9 : min(9, max(1, max(devices[idx].gearLeft, devices[idx].gearRight)))
                 let record = BlanketUsageRecord(
                     startDate: start,
                     endDate: endDate,
@@ -577,6 +583,8 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             self.verifiedWorkingKeys.removeValue(forKey: deviceID)
             self.deviceProductIDs.removeValue(forKey: deviceID)
             self.bleConnectionPhases.removeValue(forKey: deviceID)
+            self.bleConsecutiveConnectFailures.removeValue(forKey: deviceID)
+            self.bleAutoConnectHalted.remove(deviceID)
             self.peripheralToDeviceMap = self.peripheralToDeviceMap.filter { $0.value != deviceID }
         }
     }
@@ -628,9 +636,47 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
     }
 
+    /// 重置指定设备的自动重连失败计数并解除暂停（在冷启动、后台切回前台、手动点击开关机或右上角刷新时调用）
+    public func resetAutoConnectRetryLimit(for deviceID: UUID) {
+        bleQueue.async { [weak self] in
+            self?.bleConsecutiveConnectFailures[deviceID] = 0
+            self?.bleAutoConnectHalted.remove(deviceID)
+        }
+    }
+
+    private func handleConnectAttemptFailedOnBLEQueue(for deviceID: UUID) {
+        if let peripheral = activePeripherals[deviceID], peripheral.state != .disconnected {
+            centralManager?.cancelPeripheralConnection(peripheral)
+        }
+        let count = (bleConsecutiveConnectFailures[deviceID] ?? 0) + 1
+        bleConsecutiveConnectFailures[deviceID] = count
+        setConnectionPhaseOnBLEQueue(.failed, for: deviceID)
+
+        if count >= Self.maxAutoConnectAttempts {
+            bleAutoConnectHalted.insert(deviceID)
+            stopScanningOnBLEQueue()
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                let devName = self.devices.first(where: { $0.id == deviceID })?.name ?? "智能电热毯"
+                self.connectionFailureAlertMessage = "连续 \(Self.maxAutoConnectAttempts) 次尝试连接「\(devName)」未响应，已暂停自动重连。请确认电热毯已接通电源且在蓝牙范围内，可点击右上角刷新按钮、点击开关机或重新切回 App 再次尝试连接。"
+            }
+        } else if !bleIsAppInBackground {
+            // 尚未达到最大尝试次数（3 次），自动间隔 1.0 秒发起下一次重试
+            bleQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self = self,
+                      !self.bleIsAppInBackground,
+                      !self.bleAutoConnectHalted.contains(deviceID),
+                      self.bleConnectionPhases[deviceID] != .connected else { return }
+                Task.detached(priority: .userInitiated) { [weak self] in
+                    await self?.ensureConnected(deviceID: deviceID, timeout: 4.5, userInitiated: false)
+                }
+            }
+        }
+    }
+
     // MARK: - Point-to-Point Cached Direct Connection Engine (100% Off Main Thread)
     @discardableResult
-    public func ensureConnected(deviceID: UUID, timeout: TimeInterval = 7.5) async -> Bool {
+    public func ensureConnected(deviceID: UUID, timeout: TimeInterval = 4.5, userInitiated: Bool = false) async -> Bool {
         activateBluetoothIfNeeded()
 
         return await withCheckedContinuation { continuation in
@@ -641,11 +687,21 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                     return
                 }
 
+                if userInitiated {
+                    self.bleConsecutiveConnectFailures[deviceID] = 0
+                    self.bleAutoConnectHalted.remove(deviceID)
+                } else if self.bleAutoConnectHalted.contains(deviceID) {
+                    continuation.resume(returning: false)
+                    return
+                }
+
                 // 1. 当前已连接且特征值与 Notify 订阅均已就绪 -> 0ms 直接命中返回
                 if let peripheral = self.activePeripherals[deviceID],
                    peripheral.state == .connected,
                    self.controlCharacteristics[deviceID] != nil,
                    self.hasCompletedNotifyHandshake.contains(deviceID) {
+                    self.bleConsecutiveConnectFailures[deviceID] = 0
+                    self.bleAutoConnectHalted.remove(deviceID)
                     self.setConnectionPhaseOnBLEQueue(.connected, for: deviceID)
                     continuation.resume(returning: true)
                     return
@@ -656,6 +712,11 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                     continuation.resume(returning: false)
                     return
                 }
+
+                // 若当前已处于正在连接中，直接排队等待结果，避免重复叠加超时计时器
+                let alreadyConnecting = !(self.connectionContinuations[deviceID] ?? []).isEmpty
+                self.connectionContinuations[deviceID, default: []].append(continuation)
+                guard !alreadyConnecting else { return }
 
                 self.setConnectionPhaseOnBLEQueue(.connecting, for: deviceID)
 
@@ -691,18 +752,16 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                     self.startScanningOnBLEQueue(showBannerIfNotReady: false)
                 }
 
-                self.connectionContinuations[deviceID, default: []].append(continuation)
-
                 self.bleQueue.asyncAfter(deadline: .now() + timeout) { [weak self] in
                     guard let self = self else { return }
                     if let pending = self.connectionContinuations[deviceID], !pending.isEmpty {
                         let isReady = (self.bleConnectionPhases[deviceID] == .connected && self.controlCharacteristics[deviceID] != nil)
-                        if !isReady {
-                            self.setConnectionPhaseOnBLEQueue(.failed, for: deviceID)
-                        }
                         let list = self.connectionContinuations.removeValue(forKey: deviceID) ?? []
                         for cont in list {
                             cont.resume(returning: isReady)
+                        }
+                        if !isReady {
+                            self.handleConnectAttemptFailedOnBLEQueue(for: deviceID)
                         }
                     }
                 }
@@ -839,11 +898,13 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
 
     // MARK: - User & AppIntent Control Actions (UI 立即乐观响应 + BLE 全异步后台执行)
 
-    /// 1. 开关电热毯电源
+    /// 1. 开关电热毯电源（手动点击开关机时自动重置重连计数限制；若开机前设过预约开机则同步清零预约并更新系统通知）
     @MainActor
     public func setPower(isOn: Bool, for deviceID: UUID) async {
+        resetAutoConnectRetryLimit(for: deviceID)
         guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return }
         let wasOn = devices[idx].isOn
+        let hadScheduledOn = devices[idx].timeOpenHours > 0 || devices[idx].remainingTimeOpenSec > 0
         let now = Date()
 
         if isOn && !wasOn {
@@ -869,6 +930,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         } else if !isOn && wasOn {
             finalizeUsageSession(for: deviceID, endDate: now)
             devices[idx].isOn = false
+            devices[idx].mode = .normal
         } else {
             devices[idx].isOn = isOn
         }
@@ -879,6 +941,9 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         let targetClose = devices[idx].savedTimeCloseHours
         let updatedSnapshot = devices[idx]
 
+        // 同步刷新后台定时通知（若此前预埋过预约开机通知会被立即移除并替换为自动关机通知）
+        PushNotificationManager.shared.scheduleBackgroundHardwareTimerNotifications(for: updatedSnapshot)
+
         if isOn {
             isPoweringOnRestoringMemory.insert(deviceID)
         }
@@ -888,6 +953,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             isOn: isOn,
             deviceID: deviceID,
             restoreMemory: restoreMemory,
+            hadScheduledOn: hadScheduledOn,
             targetLeft: targetLeft,
             targetRight: targetRight,
             targetClose: targetClose
@@ -903,12 +969,17 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         isOn: Bool,
         deviceID: UUID,
         restoreMemory: Bool,
+        hadScheduledOn: Bool,
         targetLeft: Int,
         targetRight: Int,
         targetClose: Int
     ) async {
         if isOn {
             let ok = await sendCommand(BlanketProtocol.cmdPower(isOn: true), to: deviceID)
+            if ok && hadScheduledOn {
+                try? await Task.sleep(nanoseconds: 180_000_000)
+                await sendCommand(BlanketProtocol.cmdTimeOpen(hours: 0), to: deviceID)
+            }
             if ok && restoreMemory {
                 try? await Task.sleep(nanoseconds: 450_000_000)
                 await sendCommand(BlanketProtocol.cmdGearLeft(targetLeft), to: deviceID)
@@ -998,29 +1069,18 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
     }
 
-    /// 4. 切换工作模式（普通加热 / 2小时高温除螨模式）
+    /// 4. 切换工作模式（普通加热 / 2小时高温除螨模式）— 仅在设备已开机状态下允许切换，关机状态下绝不自动开机
     /// 开启或关闭除螨模式均保持当前 UI 界面已选挡位与定时不变；关闭除螨模式时自动忽略硬件回退的默认 9挡/12h 上报并将当前 UI 挡位与定时重新下发给设备
     @MainActor
     public func setMode(_ mode: BlanketHeatingMode, for deviceID: UUID) async {
-        guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return }
+        guard let idx = devices.firstIndex(where: { $0.id == deviceID }),
+              devices[idx].isOn else { return }
         recordGearRuntimeSlice(for: deviceID)
         let now = Date()
         let prevMode = devices[idx].mode
         devices[idx].mode = mode
         if mode == .miteRemoval && prevMode != .miteRemoval {
             devices[idx].totalMiteRemovalCount += 1
-        }
-        let needsPowerOn = !devices[idx].isOn
-        if needsPowerOn {
-            devices[idx].isOn = true
-            if devices[idx].currentSessionStartDate == nil {
-                devices[idx].currentSessionStartDate = now
-                devices[idx].totalPowerOnCount += 1
-            }
-            lastGearAccountingDates[deviceID] = now
-            devices[idx].timeOpenHours = 0
-            devices[idx].remainingTimeOpenSec = 0
-            devices[idx].scheduledOnTargetDate = nil
         }
 
         // 原版小程序除螨模式下硬件固定锁死 2 小时后关机；退出除螨模式后恢复为用户选择的 timeCloseHours 倒计时
@@ -1045,7 +1105,6 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
 
         await runModeBLEPipeline(
             mode: mode,
-            needsPowerOn: needsPowerOn,
             shouldRestoreAfterExitMite: shouldRestoreAfterExitMite,
             targetLeft: targetLeft,
             targetRight: targetRight,
@@ -1063,17 +1122,12 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
 
     private nonisolated func runModeBLEPipeline(
         mode: BlanketHeatingMode,
-        needsPowerOn: Bool,
         shouldRestoreAfterExitMite: Bool,
         targetLeft: Int,
         targetRight: Int,
         targetClose: Int,
         deviceID: UUID
     ) async {
-        if needsPowerOn {
-            await sendCommand(BlanketProtocol.cmdPower(isOn: true), to: deviceID)
-            try? await Task.sleep(nanoseconds: 350_000_000)
-        }
         await sendCommand(BlanketProtocol.cmdMode(mode), to: deviceID)
         if shouldRestoreAfterExitMite {
             // 等待设备完成模式切换并上报默认 9挡/12h 状态（在此期间 applyParsedTLVToUI 会忽略该默认上报）
@@ -1151,9 +1205,9 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
     }
 
-    /// 7. 主动查询硬件实时状态（全后台执行）
-    public func queryStatus(for deviceID: UUID) async {
-        let ready = await ensureConnected(deviceID: deviceID)
+    /// 7. 主动查询硬件实时状态（全后台执行；userInitiated 为 true 时重置重连次数限制并重新发起连接）
+    public func queryStatus(for deviceID: UUID, userInitiated: Bool = false) async {
+        let ready = await ensureConnected(deviceID: deviceID, userInitiated: userInitiated)
         guard ready else { return }
         bleQueue.async { [weak self] in
             self?.sendQueryOnBLEQueue(for: deviceID)
@@ -1275,6 +1329,8 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
 
         let isFirstHandshake = !hasCompletedNotifyHandshake.contains(deviceID)
         hasCompletedNotifyHandshake.insert(deviceID)
+        bleConsecutiveConnectFailures[deviceID] = 0
+        bleAutoConnectHalted.remove(deviceID)
         setConnectionPhaseOnBLEQueue(.connected, for: deviceID)
         stopScanningOnBLEQueue()
 
@@ -1764,9 +1820,9 @@ extension BlanketBLEManager: CBCentralManagerDelegate, CBPeripheralDelegate {
     ) {
         let pID = peripheral.identifier
         guard let deviceID = peripheralToDeviceMap[pID] else { return }
-        setConnectionPhaseOnBLEQueue(.failed, for: deviceID)
         let list = connectionContinuations.removeValue(forKey: deviceID) ?? []
         for cont in list { cont.resume(returning: false) }
+        handleConnectAttemptFailedOnBLEQueue(for: deviceID)
     }
 
     public func centralManager(
@@ -1782,9 +1838,11 @@ extension BlanketBLEManager: CBCentralManagerDelegate, CBPeripheralDelegate {
         controlCharacteristics.removeValue(forKey: deviceID)
         setConnectionPhaseOnBLEQueue(.disconnected, for: deviceID)
 
-        if !bleIsAppInBackground {
+        if !bleIsAppInBackground && !bleAutoConnectHalted.contains(deviceID) {
             bleQueue.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-                guard let self = self, !self.bleIsAppInBackground else { return }
+                guard let self = self,
+                      !self.bleIsAppInBackground,
+                      !self.bleAutoConnectHalted.contains(deviceID) else { return }
                 Task.detached(priority: .userInitiated) { [weak self] in
                     await self?.ensureConnected(deviceID: deviceID)
                 }

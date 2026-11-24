@@ -201,10 +201,29 @@ public struct RuntimeStatusView: View {
         .listStyle(.insetGrouped)
         .navigationTitle("状态与时长")
         .toolbar {
+            if bleManager.devices.count > 1 {
+                ToolbarItem(placement: .topBarLeading) {
+                    Menu {
+                        ForEach(bleManager.devices) { item in
+                            Button {
+                                bleManager.activeDeviceID = item.id
+                            } label: {
+                                Label(
+                                    "\(item.name) (\(item.roomName))",
+                                    systemImage: item.id == device.id ? "checkmark.circle.fill" : "bed.double"
+                                )
+                            }
+                        }
+                    } label: {
+                        Label(device.roomName, systemImage: "chevron.up.chevron.down")
+                    }
+                }
+            }
+
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     Task { @MainActor in
-                        await bleManager.queryStatus(for: device.id)
+                        await bleManager.queryStatus(for: device.id, userInitiated: true)
                     }
                 } label: {
                     Label("刷新状态", systemImage: "arrow.clockwise")
@@ -450,33 +469,37 @@ public struct RuntimeStatusView: View {
     /// 本次开启详细图表：双温区实时挡位对比与定时关机进度条
     private var currentSessionDetailChartContent: some View {
         let elapsedSec = Double(device.currentSessionElapsedSeconds(at: currentTime))
-        let totalCloseSec = Double(max(1, device.timeCloseHours) * 3600)
+        let totalCloseSec = Double(device.effectiveTimeCloseHours * 3600)
         let progress = device.isOn ? min(1.0, max(0.02, elapsedSec / totalCloseSec)) : 0.0
+        let displayLeftGear = (device.mode == .miteRemoval) ? 9 : device.gearLeft
+        let displayRightGear = (device.mode == .miteRemoval) ? 9 : device.gearRight
+        let displayLeftTemp = (device.mode == .miteRemoval) ? 45 : device.temperatureLeft
+        let displayRightTemp = (device.mode == .miteRemoval) ? 45 : device.temperatureRight
 
         return VStack(alignment: .leading, spacing: 14) {
             Chart {
                 BarMark(
-                    x: .value("温区", "左温区 (\(device.gearLeft)挡)"),
-                    y: .value("摄氏温度", device.temperatureLeft)
+                    x: .value("温区", "左温区 (\(displayLeftGear)挡)"),
+                    y: .value("摄氏温度", displayLeftTemp)
                 )
-                .foregroundStyle(LiquidGlassTheme.gearColor(for: device.gearLeft, mode: device.mode).gradient)
+                .foregroundStyle(LiquidGlassTheme.gearColor(for: displayLeftGear, mode: device.mode).gradient)
                 .cornerRadius(8)
                 .annotation(position: .top) {
-                    Text("\(device.temperatureLeft)°C · \(device.gearLeft)挡")
+                    Text("\(displayLeftTemp)°C · \(displayLeftGear)挡")
                         .font(.caption2.weight(.bold).monospacedDigit())
-                        .foregroundStyle(LiquidGlassTheme.gearColor(for: device.gearLeft, mode: device.mode))
+                        .foregroundStyle(LiquidGlassTheme.gearColor(for: displayLeftGear, mode: device.mode))
                 }
 
                 BarMark(
-                    x: .value("温区", "右温区 (\(device.gearRight)挡)"),
-                    y: .value("摄氏温度", device.temperatureRight)
+                    x: .value("温区", "右温区 (\(displayRightGear)挡)"),
+                    y: .value("摄氏温度", displayRightTemp)
                 )
-                .foregroundStyle(LiquidGlassTheme.gearColor(for: device.gearRight, mode: device.mode).gradient)
+                .foregroundStyle(LiquidGlassTheme.gearColor(for: displayRightGear, mode: device.mode).gradient)
                 .cornerRadius(8)
                 .annotation(position: .top) {
-                    Text("\(device.temperatureRight)°C · \(device.gearRight)挡")
+                    Text("\(displayRightTemp)°C · \(displayRightGear)挡")
                         .font(.caption2.weight(.bold).monospacedDigit())
-                        .foregroundStyle(LiquidGlassTheme.gearColor(for: device.gearRight, mode: device.mode))
+                        .foregroundStyle(LiquidGlassTheme.gearColor(for: displayRightGear, mode: device.mode))
                 }
             }
             .chartYScale(domain: 0...50)
@@ -539,9 +562,11 @@ public struct RuntimeStatusView: View {
                         Text(rec.startDate.formatted(date: .abbreviated, time: .shortened))
                             .font(.caption2.monospacedDigit())
                         Spacer()
-                        Text("\(rec.primaryGear)挡 · \(rec.mode.title)")
+                        let recGear = (rec.mode == .miteRemoval) ? 9 : rec.primaryGear
+                        let recTemp = BlanketProtocol.gearToTemp(recGear)
+                        Text("\(recGear)挡 (\(recTemp)°C) · \(rec.mode.title)")
                             .font(.caption2.weight(.medium))
-                            .foregroundStyle(LiquidGlassTheme.gearColor(for: rec.primaryGear, mode: rec.mode))
+                            .foregroundStyle(LiquidGlassTheme.gearColor(for: recGear, mode: rec.mode))
                         Text(String(format: "%.2f h", rec.durationSeconds / 3600.0))
                             .font(.caption2.weight(.semibold).monospacedDigit())
                             .foregroundStyle(.secondary)
@@ -799,18 +824,11 @@ public struct RuntimeStatusView: View {
                         )
                     )
 
-                    Picker(
-                        "前台蓝牙直连策略",
-                        systemImage: "bolt.horizontal.circle.fill",
-                        selection: bleManager.binding(
-                            for: currentDeviceID,
-                            keyPath: \.connectionPolicy,
-                            default: .smartInstantWake
-                        )
-                    ) {
-                        ForEach(BLEConnectionPolicy.allCases) { policy in
-                            Text(policy.title).tag(policy)
-                        }
+                    LabeledContent {
+                        Text("前台常连实时同步")
+                            .foregroundStyle(.secondary)
+                    } label: {
+                        Label("前台蓝牙直连策略", systemImage: "bolt.horizontal.circle.fill")
                     }
                 } header: {
                     Text("点对点连接缓存与后台断连策略")

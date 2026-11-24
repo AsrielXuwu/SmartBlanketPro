@@ -72,7 +72,7 @@ public struct DeviceListView: View {
 
                                 Button {
                                     Task { @MainActor in
-                                        await bleManager.queryStatus(for: targetID)
+                                        await bleManager.queryStatus(for: targetID, userInitiated: true)
                                     }
                                 } label: {
                                     Label("同步硬件状态", systemImage: "arrow.clockwise")
@@ -120,7 +120,7 @@ public struct DeviceListView: View {
                         let snapshotIDs = bleManager.devices.map(\.id)
                         for id in snapshotIDs {
                             Task { @MainActor in
-                                await bleManager.queryStatus(for: id)
+                                await bleManager.queryStatus(for: id, userInitiated: true)
                             }
                         }
                     } label: {

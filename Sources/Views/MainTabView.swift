@@ -54,5 +54,18 @@ public struct MainTabView: View {
             }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
+        .alert(
+            "蓝牙连接未响应",
+            isPresented: Binding(
+                get: { bleManager.connectionFailureAlertMessage != nil },
+                set: { if !$0 { bleManager.connectionFailureAlertMessage = nil } }
+            )
+        ) {
+            Button("我知道了", role: .cancel) {
+                bleManager.connectionFailureAlertMessage = nil
+            }
+        } message: {
+            Text(bleManager.connectionFailureAlertMessage ?? "")
+        }
     }
 }
