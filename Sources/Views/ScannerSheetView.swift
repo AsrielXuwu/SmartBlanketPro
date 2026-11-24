@@ -96,7 +96,7 @@ public struct ScannerSheetView: View {
                                 HStack(spacing: 12) {
                                     Image(systemName: item.isJingHeBlanket ? "bed.double.circle.fill" : "wave.3.right.circle.fill")
                                         .font(.title2)
-                                        .foregroundStyle(item.isJingHeBlanket ? .orange : .blue)
+                                        .foregroundStyle(item.isJingHeBlanket ? Color.orange : Color.blue)
 
                                     VStack(alignment: .leading, spacing: 3) {
                                         HStack(spacing: 6) {

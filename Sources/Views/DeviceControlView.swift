@@ -63,6 +63,7 @@ public struct DeviceControlView: View {
             .padding(.horizontal, 16)
             .padding(.top, 8)
             .padding(.bottom, 32)
+            .animation(LiquidGlassDesign.fluidSpring, value: device)
         }
         .background(Color(.systemGroupedBackground).ignoresSafeArea())
         .navigationTitle(device.name)
@@ -70,7 +71,9 @@ public struct DeviceControlView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    Task { await bleManager.queryStatus(for: deviceID) }
+                    Task { @MainActor in
+                        await bleManager.queryStatus(for: deviceID)
+                    }
                 } label: {
                     HStack(spacing: 4) {
                         Circle()
@@ -107,7 +110,7 @@ public struct DeviceControlView: View {
 
                     Image(systemName: device.isOn ? device.mode.symbolName : "power.circle.fill")
                         .font(.system(size: 25, weight: .semibold))
-                        .foregroundStyle(device.isOn ? themeColor : .secondary)
+                        .foregroundStyle(device.isOn ? themeColor : Color.secondary)
                         .symbolEffect(.pulse.byLayer, options: .repeating, isActive: device.isOn)
                 }
 
@@ -133,13 +136,13 @@ public struct DeviceControlView: View {
                 Spacer(minLength: 8)
 
                 Button {
-                    withAnimation(LiquidGlassDesign.fluidSpring) {
-                        Task { await bleManager.setPower(isOn: !device.isOn, for: deviceID) }
+                    Task { @MainActor in
+                        await bleManager.setPower(isOn: !device.isOn, for: deviceID)
                     }
                 } label: {
                     Image(systemName: "power")
                         .font(.system(size: 22, weight: .bold))
-                        .foregroundStyle(device.isOn ? .white : .primary)
+                        .foregroundStyle(device.isOn ? Color.white : Color.primary)
                         .frame(width: 54, height: 54)
                         .background(
                             Circle()
@@ -172,7 +175,7 @@ public struct DeviceControlView: View {
             HStack(spacing: 12) {
                 HStack(spacing: 6) {
                     Image(systemName: "clock.badge.checkmark.fill")
-                        .foregroundStyle(device.isOn ? themeColor : .secondary)
+                        .foregroundStyle(device.isOn ? themeColor : Color.secondary)
                     VStack(alignment: .leading, spacing: 1) {
                         Text("本次已开启时长")
                             .font(.caption2)
@@ -193,7 +196,7 @@ public struct DeviceControlView: View {
 
                 HStack(spacing: 6) {
                     Image(systemName: device.isOn ? "timer" : "alarm.fill")
-                        .foregroundStyle(device.isOn ? .orange : (device.timeOpenHours > 0 ? .blue : .secondary))
+                        .foregroundStyle(device.isOn ? Color.orange : (device.timeOpenHours > 0 ? Color.blue : Color.secondary))
                     VStack(alignment: .leading, spacing: 1) {
                         Text(device.isOn ? "自动关机倒计时" : "预约开机状态")
                             .font(.caption2)
@@ -226,7 +229,7 @@ public struct DeviceControlView: View {
                 Spacer()
                 Text("\(gear) 挡")
                     .font(.caption.weight(.bold).monospacedDigit())
-                    .foregroundStyle(isOn ? zoneTint : .secondary)
+                    .foregroundStyle(isOn ? zoneTint : Color.secondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 2)
                     .background((isOn ? zoneTint : Color.secondary).opacity(0.14), in: Capsule())
@@ -236,7 +239,7 @@ public struct DeviceControlView: View {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text("\(temperature)")
                     .font(.system(size: 36, weight: .bold, design: .rounded).monospacedDigit())
-                    .foregroundStyle(isOn ? .primary : .secondary)
+                    .foregroundStyle(isOn ? Color.primary : Color.secondary)
                     .contentTransition(.numericText())
                 Text("°C")
                     .font(.headline.weight(.semibold))
@@ -245,7 +248,7 @@ public struct DeviceControlView: View {
 
             // 原生进度条指示当前挡位热力 (1~9)
             ProgressView(value: Double(gear), total: 9.0)
-                .tint(isOn ? zoneTint : .secondary.opacity(0.4))
+                .tint(isOn ? zoneTint : Color.secondary.opacity(0.4))
 
             Text(LiquidGlassDesign.gearComfortDescription(gear))
                 .font(.caption2)
@@ -276,8 +279,8 @@ public struct DeviceControlView: View {
             Picker("工作模式", selection: Binding(
                 get: { device.mode },
                 set: { newMode in
-                    withAnimation(LiquidGlassDesign.fluidSpring) {
-                        Task { await bleManager.setMode(newMode, for: deviceID) }
+                    Task { @MainActor in
+                        await bleManager.setMode(newMode, for: deviceID)
                     }
                 }
             )) {
@@ -394,7 +397,7 @@ public struct DeviceControlView: View {
                 } label: {
                     Image(systemName: "minus.circle.fill")
                         .font(.title2)
-                        .foregroundStyle(gear > 1 ? .primary : .tertiary)
+                        .foregroundStyle(gear > 1 ? Color.primary : Color.secondary.opacity(0.35))
                 }
                 .buttonStyle(.plain)
                 .disabled(gear <= 1)
@@ -425,7 +428,7 @@ public struct DeviceControlView: View {
                 } label: {
                     Image(systemName: "plus.circle.fill")
                         .font(.title2)
-                        .foregroundStyle(gear < 9 ? sliderTint : .tertiary)
+                        .foregroundStyle(gear < 9 ? sliderTint : Color.secondary.opacity(0.35))
                 }
                 .buttonStyle(.plain)
                 .disabled(gear >= 9)
@@ -441,7 +444,7 @@ public struct DeviceControlView: View {
                     } label: {
                         Text("\(step)挡")
                             .font(.caption2.weight(step == gear ? .bold : .regular).monospacedDigit())
-                            .foregroundStyle(step == gear ? sliderTint : .secondary)
+                            .foregroundStyle(step == gear ? sliderTint : Color.secondary)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 4)
                             .background(
@@ -469,8 +472,8 @@ public struct DeviceControlView: View {
                     Picker("自动关机时长", selection: Binding(
                         get: { device.timeCloseHours },
                         set: { newHours in
-                            withAnimation(LiquidGlassDesign.fluidSpring) {
-                                Task { await bleManager.setAutoOffHours(newHours, for: deviceID) }
+                            Task { @MainActor in
+                                await bleManager.setAutoOffHours(newHours, for: deviceID)
                             }
                         }
                     )) {
@@ -487,13 +490,13 @@ public struct DeviceControlView: View {
                     ForEach([2, 4, 6, 8, 10, 12], id: \.self) { preset in
                         let isSelected = (device.timeCloseHours == preset)
                         Button {
-                            withAnimation(LiquidGlassDesign.fluidSpring) {
-                                Task { await bleManager.setAutoOffHours(preset, for: deviceID) }
+                            Task { @MainActor in
+                                await bleManager.setAutoOffHours(preset, for: deviceID)
                             }
                         } label: {
                             Text("\(preset)h")
                                 .font(.caption.weight(isSelected ? .bold : .medium).monospacedDigit())
-                                .foregroundStyle(isSelected ? .white : .primary)
+                                .foregroundStyle(isSelected ? Color.white : Color.primary)
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 7)
                                 .background(
@@ -517,12 +520,12 @@ public struct DeviceControlView: View {
                             .font(.subheadline.weight(.semibold))
                         Text(device.timeOpenHours > 0 ? device.formattedRemainingOpenTime : "提前暖被，到点自动开机加热")
                             .font(.caption2)
-                            .foregroundStyle(device.timeOpenHours > 0 ? .blue : .secondary)
+                            .foregroundStyle(device.timeOpenHours > 0 ? Color.blue : Color.secondary)
                             .contentTransition(.numericText())
                     }
                 } icon: {
                     Image(systemName: "alarm.waves.left.and.right.fill")
-                        .foregroundStyle(device.timeOpenHours > 0 ? .blue : .secondary)
+                        .foregroundStyle(device.timeOpenHours > 0 ? Color.blue : Color.secondary)
                 }
 
                 Spacer()
@@ -530,8 +533,8 @@ public struct DeviceControlView: View {
                 Picker("预约开机", selection: Binding(
                     get: { device.timeOpenHours },
                     set: { newOpenHours in
-                        withAnimation(LiquidGlassDesign.fluidSpring) {
-                            Task { await bleManager.setScheduledOnHours(newOpenHours, for: deviceID) }
+                        Task { @MainActor in
+                            await bleManager.setScheduledOnHours(newOpenHours, for: deviceID)
                         }
                     }
                 )) {
@@ -567,7 +570,7 @@ public struct DeviceControlView: View {
                 LabeledContent("当前工作状态") {
                     Text(device.isOn ? "正在加热 (\(device.mode.title))" : "待机休眠")
                         .font(.subheadline.weight(.medium))
-                        .foregroundStyle(device.isOn ? themeColor : .secondary)
+                        .foregroundStyle(device.isOn ? themeColor : Color.secondary)
                 }
 
                 Divider()
@@ -575,7 +578,7 @@ public struct DeviceControlView: View {
                 LabeledContent("本次已开启时长") {
                     Text(device.currentSessionElapsedHoursString(at: currentTime))
                         .font(.subheadline.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(device.isOn ? .primary : .secondary)
+                        .foregroundStyle(device.isOn ? Color.primary : Color.secondary)
                         .contentTransition(.numericText())
                 }
 

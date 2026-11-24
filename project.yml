@@ -32,4 +32,3 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.jinghe.smartblanket.pro
         PRODUCT_NAME: SmartBlanketPro
         CODE_SIGN_STYLE: Automatic
-        ENABLE_PREVIEWS: YES

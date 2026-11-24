@@ -4,7 +4,7 @@ import SwiftUI
 /// 严格按照 `UI_Design_Specification_iOS26_LiquidGlass.md` 第三章第 1 节执行：
 /// - 采用 Apple「家庭 (Home)」App 风格的原生态 `NavigationStack` 与 `Color(.systemGroupedBackground)`
 /// - 支持一键极速开关设备、实时预览双温区温度/挡位、已开启小时数与定时倒计时
-/// - 支持蓝牙扫描发现新设备、手动添加设备、重命名/修改硬件 MAC 及左滑管理
+/// - 支持蓝牙扫描发现新设备、手动添加设备、重命名/修改硬件 MAC 及上下文菜单管理
 public struct DeviceListView: View {
     @ObservedObject var bleManager: BlanketBLEManager
     @State private var showingScannerSheet = false
@@ -35,10 +35,8 @@ public struct DeviceListView: View {
                                 device: device,
                                 connectionPhase: bleManager.connectionPhase(for: device.id),
                                 onTogglePower: {
-                                    withAnimation(LiquidGlassDesign.fluidSpring) {
-                                        Task {
-                                            await bleManager.setPower(isOn: !device.isOn, for: device.id)
-                                        }
+                                    Task { @MainActor in
+                                        await bleManager.setPower(isOn: !device.isOn, for: device.id)
                                     }
                                 }
                             )
@@ -46,7 +44,9 @@ public struct DeviceListView: View {
                         .buttonStyle(.plain)
                         .contextMenu {
                             Button {
-                                Task { await bleManager.setPower(isOn: !device.isOn, for: device.id) }
+                                Task { @MainActor in
+                                    await bleManager.setPower(isOn: !device.isOn, for: device.id)
+                                }
                             } label: {
                                 Label(device.isOn ? "关闭电热毯" : "开启电热毯", systemImage: "power")
                             }
@@ -58,7 +58,9 @@ public struct DeviceListView: View {
                             }
 
                             Button {
-                                Task { await bleManager.queryStatus(for: device.id) }
+                                Task { @MainActor in
+                                    await bleManager.queryStatus(for: device.id)
+                                }
                             } label: {
                                 Label("立即同步硬件状态", systemImage: "arrow.clockwise")
                             }
@@ -81,6 +83,7 @@ public struct DeviceListView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
                 .padding(.bottom, 28)
+                .animation(LiquidGlassDesign.fluidSpring, value: bleManager.devices)
             }
             .background(Color(.systemGroupedBackground).ignoresSafeArea())
             .navigationTitle("智能电热毯")
@@ -91,7 +94,9 @@ public struct DeviceListView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
                         for dev in bleManager.devices {
-                            Task { await bleManager.queryStatus(for: dev.id) }
+                            Task { @MainActor in
+                                await bleManager.queryStatus(for: dev.id)
+                            }
                         }
                     } label: {
                         Image(systemName: "arrow.clockwise")
@@ -131,7 +136,7 @@ public struct DeviceListView: View {
                 // 胶囊 1：加热活动汇总
                 HStack(spacing: 8) {
                     Image(systemName: activeHeatingDevices.isEmpty ? "bed.double.fill" : "flame.fill")
-                        .foregroundStyle(activeHeatingDevices.isEmpty ? .secondary : .orange)
+                        .foregroundStyle(activeHeatingDevices.isEmpty ? Color.secondary : Color.orange)
                         .symbolEffect(.pulse.byLayer, options: .repeating, isActive: !activeHeatingDevices.isEmpty)
 
                     if let firstActive = activeHeatingDevices.first {
@@ -276,7 +281,7 @@ private struct DeviceGlassCardView: View {
 
                     Image(systemName: device.isOn ? device.mode.symbolName : "bed.double.fill")
                         .font(.system(size: 21, weight: .semibold))
-                        .foregroundStyle(device.isOn ? themeColor : .secondary)
+                        .foregroundStyle(device.isOn ? themeColor : Color.secondary)
                         .symbolEffect(.pulse.byLayer, options: .repeating, isActive: device.isOn)
                 }
 
@@ -304,7 +309,7 @@ private struct DeviceGlassCardView: View {
                 Button(action: onTogglePower) {
                     Image(systemName: "power")
                         .font(.system(size: 18, weight: .bold))
-                        .foregroundStyle(device.isOn ? .white : .primary)
+                        .foregroundStyle(device.isOn ? Color.white : Color.primary)
                         .frame(width: 44, height: 44)
                         .background(
                             Circle()
@@ -338,7 +343,7 @@ private struct DeviceGlassCardView: View {
             HStack(spacing: 8) {
                 Label(device.compactElapsedString(), systemImage: "clock.fill")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(device.isOn ? themeColor : .secondary)
+                    .foregroundStyle(device.isOn ? themeColor : Color.secondary)
                     .contentTransition(.numericText())
 
                 Text("·")
@@ -399,11 +404,11 @@ private struct DeviceGlassCardView: View {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
                     Text("\(temp)°C")
                         .font(.system(size: 22, weight: .bold, design: .rounded).monospacedDigit())
-                        .foregroundStyle(isOn ? .primary : .secondary)
+                        .foregroundStyle(isOn ? Color.primary : Color.secondary)
                         .contentTransition(.numericText())
                     Text("\(gear)挡")
                         .font(.caption.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(isOn ? themeColor : .secondary)
+                        .foregroundStyle(isOn ? themeColor : Color.secondary)
                         .contentTransition(.numericText())
                 }
             }
