@@ -188,6 +188,10 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             isAppInBackground = true
             flushAllActiveGearAccounting()
             saveDevicesToDiskImmediately()
+            let activeSnap = activeDevice
+            Task { @MainActor in
+                await LiveActivityManager.shared.handleAppEnteredBackground(activeDevice: activeSnap)
+            }
             for dev in devices {
                 PushNotificationManager.shared.scheduleBackgroundHardwareTimerNotifications(for: dev)
             }
@@ -772,6 +776,9 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             await sendCommand(BlanketProtocol.cmdPower(isOn: false), to: deviceID)
             scheduleDelayedQuery(for: deviceID, delaySeconds: 0.55)
         }
+        if let updated = devices.first(where: { $0.id == deviceID }) {
+            await LiveActivityManager.shared.syncActivityState(for: updated)
+        }
     }
 
     /// 2. 调节左温区挡位 (1~9)
@@ -1169,6 +1176,9 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
 
         lastNotifiedStates[deviceID] = (updated.isOn, updated.gearLeft, updated.gearRight, updated.mode, updated.timeCloseHours)
         PushNotificationManager.shared.scheduleBackgroundHardwareTimerNotifications(for: updated)
+        Task { @MainActor in
+            await LiveActivityManager.shared.syncActivityState(for: updated)
+        }
     }
 }
 

@@ -12,8 +12,10 @@ import UIKit
 public struct RuntimeStatusView: View {
     @ObservedObject var bleManager: BlanketBLEManager
     @ObservedObject private var pushManager = PushNotificationManager.shared
+    @ObservedObject private var liveActivityManager = LiveActivityManager.shared
     @Namespace private var statusGlassNamespace
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Binding var showingSettingsSheet: Bool
 
     public enum ExpandedChartType: String, Identifiable {
         case currentSession = "本次已开启详情图表"
@@ -26,7 +28,6 @@ public struct RuntimeStatusView: View {
     @State private var expandedChart: ExpandedChartType? = nil
     @State private var historyChartDays: Int = 7
     @State private var showAllNineGears: Bool = true
-    @State private var showingSettingsSheet: Bool = false
     @State private var showingClearHistorySheet: Bool = false
     @State private var selectedClearScope: UsageHistoryClearScope = .customRange
     @State private var customClearStartDate: Date = Calendar.current.date(byAdding: .day, value: -7, to: Date()) ?? Date()
@@ -36,8 +37,12 @@ public struct RuntimeStatusView: View {
     /// 15 秒低频时钟刷新，彻底消除每秒重排导致的滚动掉帧
     private let clockTimer = Timer.publish(every: 15.0, on: .main, in: .common).autoconnect()
 
-    public init(bleManager: BlanketBLEManager) {
+    public init(
+        bleManager: BlanketBLEManager,
+        showingSettingsSheet: Binding<Bool> = .constant(false)
+    ) {
         self.bleManager = bleManager
+        self._showingSettingsSheet = showingSettingsSheet
     }
 
     private var device: BlanketDevice {
@@ -65,9 +70,33 @@ public struct RuntimeStatusView: View {
 
     public var body: some View {
         List {
-            // MARK: 1. iOS 小组件风格多维数据统计矩阵 (1x1 + 2x2 + 2x1 混合 Bento 布局，全宽 Section 绝不裁切阴影)
+            // MARK: 1. 顶部两个 1x1 卡片（独立固定高度 Section，展开下方图表时绝不往上跳动）
             Section {
-                widgetBentoAnalyticsGrid
+                topTwoSummaryCardsRow
+            }
+            .listSectionMargins(.horizontal, 0)
+            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+
+            // MARK: 1.5 动态展开的 2x2 详细运行记录图表（独立 Section 平滑推拉，顶部卡片纹丝不动）
+            if let activeChart = expandedChart {
+                Section {
+                    expandedRuntimeChartCard(for: activeChart)
+                        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 6)
+                }
+                .listSectionMargins(.horizontal, 0)
+                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+                .transition(.opacity)
+            }
+
+            // MARK: 1.8 其余 iOS 小组件 Bento 矩阵 (本周/本月 + 2x1 宽卡 + 2x2 挡位排行)
+            Section {
+                lowerBentoWidgetsGrid
             }
             .listSectionMargins(.horizontal, 0)
             .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
@@ -220,129 +249,116 @@ public struct RuntimeStatusView: View {
         }
     }
 
-    // MARK: - iOS 小组件风格混合组合统计矩阵 (1x1 + 2x2 + 2x1 Bento Grid)
-    private var widgetBentoAnalyticsGrid: some View {
+    // MARK: - 顶部两个 1x1 卡片（独立 Section，高度恒定不跳动）
+    private var topTwoSummaryCardsRow: some View {
         let sessionTint = LiquidGlassTheme.activeGlassBackgroundTint(
             isOn: device.isOn,
             mode: device.mode,
             gear: max(device.gearLeft, device.gearRight)
         )
 
-        return VStack(spacing: 14) {
-            // 第一行：两个 1x1 小组件卡片（点击可展开详细运行记录图表）
-            GlassEffectContainer(spacing: 6) {
-                HStack(spacing: 14) {
-                    // 左 1x1：本次已开启（点击展开本次运行图表）
-                    Button {
-                        withAnimation(morphAnimation) {
-                            expandedChart = (expandedChart == .currentSession) ? nil : .currentSession
-                        }
-                    } label: {
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Label {
-                                    Text("本次已开启")
-                                } icon: {
-                                    Image(systemName: "flame.fill")
-                                        .foregroundStyle(device.isOn ? Color.primary : Color.cyan)
-                                }
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-
-                                Spacer()
-
-                                Image(systemName: expandedChart == .currentSession ? "chevron.up.circle.fill" : "chart.xyaxis.line")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            Text(String(format: "%.2f h", Double(device.currentSessionElapsedSeconds(at: currentTime)) / 3600.0))
-                                .font(.system(size: 30, weight: .bold, design: .rounded).monospacedDigit())
-                                .foregroundStyle(.primary)
-                                .contentTransition(.numericText())
-
-                            Text(device.isOn ? device.currentSessionElapsedHoursString(at: currentTime) : "点击查看实时运行轨迹")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        .padding(16)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .buttonStyle(.plain)
-                    .glassEffect(
-                        sessionTint != nil
-                            ? .regular.tint(sessionTint!).interactive()
-                            : .regular.interactive(),
-                        in: .rect(cornerRadius: 24)
-                    )
-                    .glassEffectID("sessionHours", in: statusGlassNamespace)
-
-                    // 右 1x1：历史累计运行（点击展开历史趋势图表）
-                    Button {
-                        withAnimation(morphAnimation) {
-                            expandedChart = (expandedChart == .historicalDaily) ? nil : .historicalDaily
-                        }
-                    } label: {
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Label {
-                                    Text("历史累计运行")
-                                } icon: {
-                                    Image(systemName: "chart.bar.fill")
-                                        .foregroundStyle(.blue)
-                                }
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-
-                                Spacer()
-
-                                Image(systemName: expandedChart == .historicalDaily ? "chevron.up.circle.fill" : "chart.bar.xaxis")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            Text(String(format: "%.1f h", device.totalHistoricalHours(at: currentTime)))
-                                .font(.system(size: 30, weight: .bold, design: .rounded).monospacedDigit())
-                                .foregroundStyle(.primary)
-                                .contentTransition(.numericText())
-
-                            Text("累计 \(device.totalPowerOnCount) 次 · 点击展开图表")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        .padding(16)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
-                    .glassEffectID("totalHours", in: statusGlassNamespace)
+        return HStack(spacing: 14) {
+            Button {
+                withAnimation(.snappy(duration: 0.32, extraBounce: 0.04)) {
+                    expandedChart = (expandedChart == .currentSession) ? nil : .currentSession
                 }
-            }
-
-            // 动态展开区：2x2 详细运行记录图表大卡片 (Requirement 7)
-            if let activeChart = expandedChart {
-                expandedRuntimeChartCard(for: activeChart)
-                    .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
-                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .top)))
-            }
-
-            // 第二行：两个 1x1 小组件卡片（本周运行时间 + 本月运行时间）
-            HStack(spacing: 14) {
-                // 左 1x1：本周运行时间
+            } label: {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Label {
-                            Text("本周运行时间")
+                            Text("本次已开启")
                         } icon: {
-                            Image(systemName: "calendar.badge.clock")
-                                .foregroundStyle(.green)
+                            Image(systemName: "flame.fill")
+                                .foregroundStyle(device.isOn ? Color.primary : Color.cyan)
                         }
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
+
                         Spacer()
+
+                        Image(systemName: expandedChart == .currentSession ? "chevron.up.circle.fill" : "chart.xyaxis.line")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
+
+                    Text(String(format: "%.2f h", Double(device.currentSessionElapsedSeconds(at: currentTime)) / 3600.0))
+                        .font(.system(size: 30, weight: .bold, design: .rounded).monospacedDigit())
+                        .foregroundStyle(.primary)
+                        .contentTransition(.numericText())
+
+                    Text(device.isOn ? device.currentSessionElapsedHoursString(at: currentTime) : "点击查看实时运行轨迹")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .glassEffect(
+                sessionTint != nil
+                    ? .regular.tint(sessionTint!).interactive()
+                    : .regular.interactive(),
+                in: .rect(cornerRadius: 24)
+            )
+
+            Button {
+                withAnimation(.snappy(duration: 0.32, extraBounce: 0.04)) {
+                    expandedChart = (expandedChart == .historicalDaily) ? nil : .historicalDaily
+                }
+            } label: {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label {
+                            Text("历史累计运行")
+                        } icon: {
+                            Image(systemName: "chart.bar.fill")
+                                .foregroundStyle(.blue)
+                        }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                        Spacer()
+
+                        Image(systemName: expandedChart == .historicalDaily ? "chevron.up.circle.fill" : "chart.bar.xaxis")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text(String(format: "%.1f h", device.totalHistoricalHours(at: currentTime)))
+                        .font(.system(size: 30, weight: .bold, design: .rounded).monospacedDigit())
+                        .foregroundStyle(.primary)
+                        .contentTransition(.numericText())
+
+                    Text("累计 \(device.totalPowerOnCount) 次 · 点击展开图表")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 16)
+        .padding(.bottom, 8)
+    }
+
+    // MARK: - 其余 iOS 小组件 Bento 网格（本周/本月 + 2x1 宽卡 + 2x2 挡位排行）
+    private var lowerBentoWidgetsGrid: some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 14) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label {
+                        Text("本周运行时间")
+                    } icon: {
+                        Image(systemName: "calendar.badge.clock")
+                            .foregroundStyle(.green)
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
 
                     Text(String(format: "%.1f h", device.weeklyRuntimeHours(at: currentTime)))
                         .font(.system(size: 26, weight: .bold, design: .rounded).monospacedDigit())
@@ -357,19 +373,15 @@ public struct RuntimeStatusView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
 
-                // 右 1x1：本月运行时间
                 VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Label {
-                            Text("本月运行时间")
-                        } icon: {
-                            Image(systemName: "calendar")
-                                .foregroundStyle(.indigo)
-                        }
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        Spacer()
+                    Label {
+                        Text("本月运行时间")
+                    } icon: {
+                        Image(systemName: "calendar")
+                            .foregroundStyle(.indigo)
                     }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
 
                     Text(String(format: "%.1f h", device.monthlyRuntimeHours(at: currentTime)))
                         .font(.system(size: 26, weight: .bold, design: .rounded).monospacedDigit())
@@ -385,16 +397,14 @@ public struct RuntimeStatusView: View {
                 .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
             }
 
-            // 第三行：2x1 宽幅横向小组件卡片（单次均时、首选温区与除螨健康概览）
             wideOverviewWidgetCard
                 .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
 
-            // 第四行：2x2 大号方形小组件卡片（最常使用挡位排行 & 各挡位运行时间分布）
             gearUsageRanking2x2WidgetCard
                 .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
         }
         .padding(.horizontal, 20)
-        .padding(.top, 16)
+        .padding(.top, 8)
         .padding(.bottom, 18)
     }
 
@@ -736,6 +746,47 @@ public struct RuntimeStatusView: View {
 
         return NavigationStack {
             Form {
+                // 0. 灵动岛与实时活动 Section (iOS 26/27 Liquid Glass Live Activities)
+                Section {
+                    Toggle(
+                        "切入后台自动上岛 (仅设备开启时)",
+                        systemImage: "platter.filled.top.and.arrow.up.iphone",
+                        isOn: $liveActivityManager.autoStartLiveActivityInBackground
+                    )
+
+                    Picker(
+                        "关机后自动关闭卡片延时",
+                        systemImage: "timer.circle",
+                        selection: $liveActivityManager.liveActivityAutoDismissMinutes
+                    ) {
+                        Text("1 分钟后").tag(1)
+                        Text("3 分钟后").tag(3)
+                        Text("5 分钟后").tag(5)
+                        Text("10 分钟后").tag(10)
+                    }
+
+                    Button {
+                        Task { @MainActor in
+                            await liveActivityManager.startOrUpdateActivity(for: device)
+                        }
+                    } label: {
+                        Label(device.isOn ? "立即更新灵动岛实时活动" : "请先开启电热毯后再上岛", systemImage: "sparkles.rectangle.stack.fill")
+                    }
+                    .disabled(!device.isOn)
+
+                    Button(role: .destructive) {
+                        Task { @MainActor in
+                            await liveActivityManager.endAllActivitiesImmediately()
+                        }
+                    } label: {
+                        Label("立即关闭当前实时活动卡片", systemImage: "xmark.circle")
+                    }
+                } header: {
+                    Text("灵动岛与实时活动")
+                } footer: {
+                    Text("开启后，当电热毯处于加热状态并切入后台时自动上岛；灵动岛与锁屏卡片内置系统级零唤醒倒计时与滚轮式快捷调挡、开关机按钮。设备关机后将在设定延时后自动关闭卡片以节省电量。")
+                }
+
                 // 1. 点对点连接缓存与后台断连策略 Section
                 Section {
                     Toggle(
