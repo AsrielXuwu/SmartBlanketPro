@@ -35,6 +35,8 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
     }
 
     // MARK: - Point-to-Point Cache
+    private let bleQueue = DispatchQueue(label: "com.smartblanketpro.ble.queue", qos: .userInitiated)
+    private var lastDiscoveredUIUpdateDates: [UUID: Date] = [:]
     private var centralManager: CBCentralManager?
     private var isBluetoothActivated: Bool = false
     private var activePeripherals: [UUID: CBPeripheral] = [:]
@@ -168,7 +170,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
         guard !isBluetoothActivated else { return }
         isBluetoothActivated = true
-        centralManager = CBCentralManager(delegate: self, queue: .main)
+        centralManager = CBCentralManager(delegate: self, queue: bleQueue)
     }
 
     // MARK: - App ScenePhase Lifecycle (切入后台自动断连 & 回到前台定向重连，绝不篡改已保存设备 MAC)
@@ -1305,9 +1307,18 @@ extension BlanketBLEManager: CBCentralManagerDelegate, CBPeripheralDelegate {
                 lastSeen: Date()
             )
 
+            let now = Date()
             if let existingIndex = self.discoveredPeripherals.firstIndex(where: { $0.id == pID }) {
-                self.discoveredPeripherals[existingIndex] = item
+                let prev = self.discoveredPeripherals[existingIndex]
+                let lastUIUpdate = self.lastDiscoveredUIUpdateDates[pID] ?? .distantPast
+                let macChanged = (prev.extractedMAC != item.extractedMAC)
+                // 节流：非关键数据变化时最多每 1.0 秒刷新一次列表，彻底消除刚启动自动连接时主线程卡顿
+                if macChanged || now.timeIntervalSince(lastUIUpdate) >= 1.0 {
+                    self.lastDiscoveredUIUpdateDates[pID] = now
+                    self.discoveredPeripherals[existingIndex] = item
+                }
             } else {
+                self.lastDiscoveredUIUpdateDates[pID] = now
                 self.discoveredPeripherals.append(item)
             }
         }

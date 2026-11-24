@@ -66,38 +66,30 @@ public struct RuntimeStatusView: View {
 
     public var body: some View {
         List {
-            // MARK: 1. 顶部两个 1x1 卡片（独立固定高度 Section，展开下方图表时顶部卡片纹丝不动；未展开时上下间距 7+7=14pt 与原版完全一致）
+            // MARK: 1. 顶部两个 1x1 卡片 + 动态图表 + 其余小组件置于同一 Section 的独立行中（消除跨 Section 默认大间距，保持精确 14pt 间距且展开不跳动）
             Section {
                 topTwoSummaryCardsRow
-            }
-            .listSectionMargins(.horizontal, 0)
-            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-            .listRowBackground(Color.clear)
-            .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
 
-            // MARK: 1.5 动态展开的 2x2 详细运行记录图表（独立 Section 平滑推拉其他组件）
-            if let activeChart = expandedChart {
-                Section {
+                if let activeChart = expandedChart {
                     expandedRuntimeChartCard(for: activeChart)
-                        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
+                        .glassEffect(.regular, in: .rect(cornerRadius: 24))
                         .padding(.horizontal, 20)
                         .padding(.vertical, 7)
+                        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .transition(.opacity)
                 }
-                .listSectionMargins(.horizontal, 0)
-                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-                .transition(.opacity)
-            }
 
-            // MARK: 1.8 其余 iOS 小组件风格 Bento 矩阵 (本周/本月 + 2x1 宽卡 + 2x2 挡位排行)
-            Section {
                 lowerBentoWidgetsGrid
+                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
             }
             .listSectionMargins(.horizontal, 0)
-            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-            .listRowBackground(Color.clear)
-            .listRowSeparator(.hidden)
 
             // MARK: 2. 实时运行状态明细 Section
             Section("实时加热与定时遥测") {
@@ -425,7 +417,7 @@ public struct RuntimeStatusView: View {
                 Spacer()
 
                 if chartType == .historicalDaily {
-                    Picker("统计跨度", selection: $historyChartDays) {
+                    Picker("统计跨度", selection: $historyChartDays.animation(.easeInOut(duration: 0.2))) {
                         Text("近7天").tag(7)
                         Text("近14天").tag(14)
                     }

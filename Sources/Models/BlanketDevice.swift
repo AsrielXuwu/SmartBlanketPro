@@ -418,13 +418,25 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
         return nil
     }
 
+    private static let chartWeekdayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "E"
+        return f
+    }()
+
+    private static let chartMonthDayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "MM/dd"
+        return f
+    }()
+
     /// 生成最近 N 天（如 7 天或 14 天）的每日运行时长图表数据
     public func dailyUsageChartPoints(days: Int = 7, at now: Date = Date()) -> [DailyUsageChartPoint] {
         let calendar = Calendar.current
         let todayStart = calendar.startOfDay(for: now)
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.dateFormat = days <= 7 ? "E" : "MM/dd"
+        let formatter = days <= 7 ? Self.chartWeekdayFormatter : Self.chartMonthDayFormatter
 
         var points: [DailyUsageChartPoint] = []
         for offset in stride(from: -(days - 1), through: 0, by: 1) {

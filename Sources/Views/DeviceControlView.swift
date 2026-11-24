@@ -307,17 +307,23 @@ public struct DeviceControlView: View {
             return 0
         } action: { _, scrollState in
             if scrollState == 1 && !isFloatingDockCollapsed {
-                withAnimation(.spring(duration: 0.3, bounce: 0.1)) {
+                withAnimation(.easeInOut(duration: 0.22)) {
                     isFloatingDockCollapsed = true
                 }
             } else if scrollState == -1 && isFloatingDockCollapsed {
-                withAnimation(.spring(duration: 0.3, bounce: 0.1)) {
+                withAnimation(.easeInOut(duration: 0.22)) {
                     isFloatingDockCollapsed = false
                 }
             }
         }
         .overlay(alignment: .bottom) {
-            floatingLiquidGlassBottomDock
+            ControlFloatingDockView(
+                bleManager: bleManager,
+                deviceID: deviceID,
+                device: device,
+                dominantGearColor: dominantGearColor,
+                isCollapsed: isFloatingDockCollapsed
+            )
         }
         .navigationTitle(device.name)
         .navigationBarTitleDisplayMode(.large)
@@ -900,103 +906,100 @@ public struct DeviceControlView: View {
         .padding(.vertical, 6)
     }
 
-    // MARK: - 底部悬浮 Liquid Glass 快捷控制坞
-    /// 【修复白底闪烁与掉帧】：保持每个按钮为单一持久化 View 实例（绝不用 if/else 分支销毁重建 _UIGlassEffect 视图），
-    /// 仅在同一按钮内部平滑收起文字，因此底层液态玻璃材质层始终常驻，0 白闪、120Hz 满帧丝滑过渡！
-    private var floatingLiquidGlassBottomDock: some View {
-        GlassEffectContainer(spacing: 12) {
-            HStack(spacing: 10) {
-                if isFloatingDockCollapsed {
-                    Spacer(minLength: 0)
-                }
+}
 
-                // 1. 开关电热毯悬浮按钮（单一持久化视图，关闭时无彩色背景，开启时按当前挡位/模式显色）
-                Button {
-                    Task { @MainActor in
-                        await bleManager.setPower(isOn: !device.isOn, for: deviceID)
-                    }
-                } label: {
-                    HStack(spacing: isFloatingDockCollapsed ? 0 : 6) {
-                        Image(systemName: "power")
-                            .font(.title3.weight(.semibold))
-                            .foregroundStyle(device.isOn ? Color.white : Color.primary)
-                        if !isFloatingDockCollapsed {
-                            Text(device.isOn ? "关闭电热毯" : "开启电热毯")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(device.isOn ? Color.white : Color.primary)
-                                .lineLimit(1)
-                        }
-                    }
-                    .frame(maxWidth: isFloatingDockCollapsed ? nil : .infinity)
-                    .padding(.vertical, isFloatingDockCollapsed ? 6 : 4)
-                    .padding(.horizontal, isFloatingDockCollapsed ? 6 : 8)
-                }
-                .buttonStyle(.glassProminent)
-                .buttonBorderShape(.capsule)
-                .tint(device.isOn ? dominantGearColor : Color.secondary.opacity(0.22))
-                .sensoryFeedback(.impact(weight: .heavy), trigger: device.isOn)
-                .accessibilityLabel(device.isOn ? "关闭电热毯" : "开启电热毯")
+/// 独立抽离的底部悬浮液态玻璃控制坞（隔离重绘作用域：展开/收起时绝不触发上方 List 重排掉帧）
+private struct ControlFloatingDockView: View {
+    @ObservedObject var bleManager: BlanketBLEManager
+    let deviceID: UUID
+    let device: BlanketDevice
+    let dominantGearColor: Color
+    let isCollapsed: Bool
 
-                // 2. 切换除螨模式悬浮按钮（单一持久化视图，除螨开启时为红色，关闭时无背景色）
-                Button {
-                    let nextMode: BlanketHeatingMode = (device.mode == .miteRemoval) ? .normal : .miteRemoval
-                    Task { @MainActor in
-                        await bleManager.setMode(nextMode, for: deviceID)
-                    }
-                } label: {
-                    HStack(spacing: isFloatingDockCollapsed ? 0 : 6) {
-                        Image(systemName: "sparkles")
-                            .font(.title3)
-                            .foregroundStyle(
-                                (device.isOn && device.mode == .miteRemoval)
-                                    ? Color.red
-                                    : Color.primary
-                            )
-                        if !isFloatingDockCollapsed {
-                            Text(device.mode == .miteRemoval ? "除螨中" : "除螨")
-                                .font(.subheadline.weight(.medium))
-                                .foregroundStyle(
-                                    (device.isOn && device.mode == .miteRemoval)
-                                        ? Color.red
-                                        : Color.primary
-                                )
-                                .lineLimit(1)
-                        }
-                    }
-                    .padding(.vertical, isFloatingDockCollapsed ? 6 : 4)
-                    .padding(.horizontal, isFloatingDockCollapsed ? 6 : 8)
-                }
-                .buttonStyle(.glass)
-                .buttonBorderShape(.capsule)
-                .tint((device.isOn && device.mode == .miteRemoval) ? Color.red : Color.primary)
-                .accessibilityLabel("切换除螨模式")
-
-                // 3. 一键切换双区同步液态玻璃圆钮
-                Button {
-                    withAnimation(morphAnimation) {
-                        let current = device.syncDualZones
-                        bleManager.binding(for: deviceID, keyPath: \.syncDualZones, default: false).wrappedValue = !current
-                    }
-                } label: {
-                    Image(systemName: device.syncDualZones ? "link.circle.fill" : "rectangle.split.2x1")
-                        .font(.title3)
-                        .foregroundStyle(
-                            LiquidGlassTheme.iconColor(
-                                for: .dualZone,
-                                isOn: device.isOn,
-                                mode: device.mode,
-                                gear: device.gearLeft
-                            )
-                        )
-                        .padding(isFloatingDockCollapsed ? 6 : 4)
-                }
-                .buttonStyle(.glass)
-                .buttonBorderShape(.circle)
-                .accessibilityLabel("切换双温区同步")
+    var body: some View {
+        HStack(spacing: 10) {
+            if isCollapsed {
+                Spacer(minLength: 0)
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 6)
-            .padding(.bottom, 8)
+
+            // 1. 开关电热毯悬浮按钮
+            Button {
+                Task { @MainActor in
+                    await bleManager.setPower(isOn: !device.isOn, for: deviceID)
+                }
+            } label: {
+                HStack(spacing: isCollapsed ? 0 : 6) {
+                    Image(systemName: "power")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(device.isOn ? Color.white : Color.primary)
+                    if !isCollapsed {
+                        Text(device.isOn ? "关闭电热毯" : "开启电热毯")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(device.isOn ? Color.white : Color.primary)
+                            .lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: isCollapsed ? nil : .infinity)
+                .padding(.vertical, isCollapsed ? 6 : 4)
+                .padding(.horizontal, isCollapsed ? 6 : 8)
+            }
+            .buttonStyle(.glassProminent)
+            .buttonBorderShape(.capsule)
+            .tint(device.isOn ? dominantGearColor : Color.secondary.opacity(0.22))
+            .sensoryFeedback(.impact(weight: .heavy), trigger: device.isOn)
+            .accessibilityLabel(device.isOn ? "关闭电热毯" : "开启电热毯")
+
+            // 2. 切换除螨模式悬浮按钮
+            Button {
+                let nextMode: BlanketHeatingMode = (device.mode == .miteRemoval) ? .normal : .miteRemoval
+                Task { @MainActor in
+                    await bleManager.setMode(nextMode, for: deviceID)
+                }
+            } label: {
+                HStack(spacing: isCollapsed ? 0 : 6) {
+                    Image(systemName: "sparkles")
+                        .font(.title3)
+                        .foregroundStyle((device.isOn && device.mode == .miteRemoval) ? Color.red : Color.primary)
+                    if !isCollapsed {
+                        Text(device.mode == .miteRemoval ? "除螨中" : "除螨")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle((device.isOn && device.mode == .miteRemoval) ? Color.red : Color.primary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.vertical, isCollapsed ? 6 : 4)
+                .padding(.horizontal, isCollapsed ? 6 : 8)
+            }
+            .buttonStyle(.glass)
+            .buttonBorderShape(.capsule)
+            .tint((device.isOn && device.mode == .miteRemoval) ? Color.red : Color.primary)
+            .accessibilityLabel("切换除螨模式")
+
+            // 3. 一键切换双区同步液态玻璃圆钮
+            Button {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    let current = device.syncDualZones
+                    bleManager.binding(for: deviceID, keyPath: \.syncDualZones, default: false).wrappedValue = !current
+                }
+            } label: {
+                Image(systemName: device.syncDualZones ? "link.circle.fill" : "rectangle.split.2x1")
+                    .font(.title3)
+                    .foregroundStyle(
+                        LiquidGlassTheme.iconColor(
+                            for: .dualZone,
+                            isOn: device.isOn,
+                            mode: device.mode,
+                            gear: device.gearLeft
+                        )
+                    )
+                    .padding(isCollapsed ? 6 : 4)
+            }
+            .buttonStyle(.glass)
+            .buttonBorderShape(.circle)
+            .accessibilityLabel("切换双温区同步")
         }
+        .padding(.horizontal, 16)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
     }
 }
