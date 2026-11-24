@@ -9,22 +9,24 @@ on:
 
 jobs:
   build-ios-ipa:
-    name: Compile SwiftUI App & Package IPA (macOS Cloud Runner)
-    runs-on: macos-15
+    name: Compile iOS 26/27 Liquid Glass App & Package IPA (macOS 26 + Xcode 26)
+    runs-on: macos-26
 
     steps:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Install XcodeGen & Generate .xcodeproj
+      - name: 2. Verify Xcode 26 SDK & Generate .xcodeproj via XcodeGen
         run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
           if ! command -v xcodegen &> /dev/null; then
             brew install xcodegen
           fi
           xcodegen generate
           ls -la SmartBlanketPro.xcodeproj
 
-      - name: 3. Build Release .app via xcodebuild
+      - name: 3. Build Release .app with iOS 26+ Liquid Glass SDK
         run: |
           xcodebuild clean build \
             -project SmartBlanketPro.xcodeproj \
@@ -42,11 +44,9 @@ jobs:
         run: |
           APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -name "SmartBlanketPro.app" -type d | head -n 1)
           echo "Found compiled app at: $APP_PATH"
-          echo "=== Verifying Info.plist contains NSBluetoothAlwaysUsageDescription ==="
           plutil -p "$APP_PATH/Info.plist"
           mkdir -p "$RUNNER_TEMP/ipa_build/Payload"
           cp -R "$APP_PATH" "$RUNNER_TEMP/ipa_build/Payload/SmartBlanketPro.app"
-          # Ad-hoc sign binary so Mach-O LC_CODE_SIGNATURE is valid across iOS 17~27 & sideloaders
           codesign --force --deep --sign - "$RUNNER_TEMP/ipa_build/Payload/SmartBlanketPro.app"
           cd "$RUNNER_TEMP/ipa_build"
           zip -qry "$GITHUB_WORKSPACE/SmartBlanketPro-Unsigned.ipa" Payload

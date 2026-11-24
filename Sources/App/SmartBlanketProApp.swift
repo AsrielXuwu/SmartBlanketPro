@@ -6,7 +6,7 @@ struct SmartBlanketProApp: App {
 
     var body: some Scene {
         WindowGroup {
-            DeviceListView(bleManager: bleManager)
+            MainTabView(bleManager: bleManager)
                 .onAppear {
                     bleManager.activateBluetoothIfNeeded()
                 }

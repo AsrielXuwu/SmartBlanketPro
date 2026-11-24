@@ -1,10 +1,7 @@
 import SwiftUI
 
 /// 蓝牙扫描发现与设备配对原生模态抽屉 (`ScannerSheetView`)
-/// 严格按照 `UI_Design_Specification_iOS26_LiquidGlass.md` 第三章第 3 节执行：
-/// - 自动识别以 `J` 开头或含 `0x5700` Service UUID / Service Data 的晶合物联蓝牙电热毯
-/// - 自动从 14 字节 `0x5700` Service Data 的第 6~11 字节提取真实硬件 MAC 地址用于派生 DES 密钥
-/// - 支持一键配对添加，同时提供手动输入硬件 MAC 地址的兜底能力
+/// 严格采用 iOS 26 / iOS 27 原生 `List`、`.buttonStyle(.glass)` / `.buttonStyle(.glassProminent)`
 public struct ScannerSheetView: View {
     @ObservedObject var bleManager: BlanketBLEManager
     @Environment(\.dismiss) private var dismiss
@@ -29,8 +26,8 @@ public struct ScannerSheetView: View {
     public var body: some View {
         NavigationStack {
             List {
-                // 1. 扫描雷达状态与过滤开关 Section
-                Section {
+                // 1. 扫描状态与过滤开关 Section
+                Section("蓝牙发现雷达") {
                     HStack(spacing: 12) {
                         Image(systemName: "dot.radiowaves.left.and.right")
                             .font(.title2)
@@ -54,158 +51,119 @@ public struct ScannerSheetView: View {
                                 bleManager.startScanning()
                             }
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.glass)
                         .controlSize(.small)
                     }
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 2)
 
-                    Toggle(isOn: $bleManager.onlyFilterJingHeDevices.animation(LiquidGlassDesign.fluidSpring)) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("仅显示晶合物联电热毯 (J* / 0x5700)")
-                                .font(.subheadline)
-                            Text("关闭后可查看周围所有广播名称的 BLE 蓝牙设备")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                } header: {
-                    Text("蓝牙发现雷达")
+                    Toggle(
+                        "仅显示晶合物联电热毯 (J* / 0x5700)",
+                        systemImage: "line.3.horizontal.decrease.circle",
+                        isOn: $bleManager.onlyFilterJingHeDevices
+                    )
                 }
 
-                // 2. 扫描发现的设备列表 Section
+                // 2. 扫描到的蓝牙设备列表 Section
                 Section {
                     if filteredPeripherals.isEmpty {
-                        VStack(spacing: 10) {
+                        HStack(spacing: 12) {
                             ProgressView()
-                                .controlSize(.regular)
-                            Text("正在搜寻广播包 (0x5700 / JH_*)...")
-                                .font(.footnote)
+                            Text("正在搜寻晶合物联 0x5700 广播包...")
+                                .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 20)
+                        .padding(.vertical, 8)
                     } else {
                         ForEach(filteredPeripherals) { item in
-                            Button {
-                                selectedDiscovered = item
-                                customName = item.name.hasPrefix("J") ? "主卧智能电热毯" : item.name
-                                if let mac = item.extractedMAC {
-                                    manualMAC = mac
-                                }
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Image(systemName: item.isJingHeBlanket ? "bed.double.circle.fill" : "wave.3.right.circle.fill")
-                                        .font(.title2)
-                                        .foregroundStyle(item.isJingHeBlanket ? Color.orange : Color.blue)
+                            HStack(spacing: 12) {
+                                Image(systemName: item.isJingHeBlanket ? "bed.double.circle.fill" : "wave.3.right.circle.fill")
+                                    .font(.title2)
+                                    .foregroundStyle(item.isJingHeBlanket ? Color.orange : Color.blue)
 
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        HStack(spacing: 6) {
-                                            Text(item.name)
-                                                .font(.subheadline.weight(.semibold))
-                                                .foregroundStyle(.primary)
-                                            if item.isJingHeBlanket {
-                                                Text("晶合协议")
-                                                    .font(.caption2.weight(.bold))
-                                                    .foregroundStyle(.orange)
-                                                    .padding(.horizontal, 6)
-                                                    .padding(.vertical, 1)
-                                                    .background(Color.orange.opacity(0.14), in: Capsule())
-                                            }
-                                        }
-                                        Text("MAC: \(item.displayMAC)")
-                                            .font(.caption2.monospaced())
-                                            .foregroundStyle(.secondary)
-                                    }
-
-                                    Spacer()
-
-                                    Text("\(item.rssi) dBm")
-                                        .font(.caption.monospacedDigit())
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.name)
+                                        .font(.subheadline.weight(.semibold))
+                                    Text("MAC: \(item.displayMAC) · \(item.rssi) dBm")
+                                        .font(.caption2.monospaced())
                                         .foregroundStyle(.secondary)
-
-                                    Image(systemName: "plus.circle.fill")
-                                        .foregroundStyle(.blue)
                                 }
+
+                                Spacer()
+
+                                Button("选择") {
+                                    selectedDiscovered = item
+                                    customName = item.name.hasPrefix("J") ? "主卧智能电热毯" : item.name
+                                    if let mac = item.extractedMAC {
+                                        manualMAC = mac
+                                    }
+                                }
+                                .buttonStyle(.glassProminent)
+                                .controlSize(.small)
                             }
-                            .buttonStyle(.plain)
+                            .padding(.vertical, 2)
                         }
                     }
                 } header: {
                     Text("发现的设备 (\(filteredPeripherals.count))")
                 } footer: {
-                    Text("点击列表中的设备即可自动提取广播 MAC 地址并绑定至本地设备中心。")
+                    Text("点击「选择」可自动从 0x5700 广播包第 6~11 字节提取硬件 MAC 地址。")
                 }
 
-                // 3. 配对信息确认或手动通过 MAC 添加设备 Section
-                Section {
-                    DisclosureGroup(
-                        isExpanded: Binding(
-                            get: { selectedDiscovered != nil || showingManualAddSection },
-                            set: { showingManualAddSection = $0 }
-                        )
-                    ) {
-                        LabeledContent("设备名称") {
-                            TextField("例如：主卧电热毯", text: $customName)
-                                .multilineTextAlignment(.trailing)
-                        }
-                        LabeledContent("所属房间") {
-                            TextField("例如：主卧", text: $roomName)
-                                .multilineTextAlignment(.trailing)
-                        }
-                        LabeledContent("硬件 MAC") {
-                            TextField("8E:B2:D6:64:F8:60", text: $manualMAC)
-                                .font(.system(.body, design: .monospaced))
-                                .multilineTextAlignment(.trailing)
-                                .textInputAutocapitalization(.characters)
-                                .autocorrectionDisabled()
-                        }
-
-                        Button {
-                            if let discovered = selectedDiscovered {
-                                bleManager.addOrUpdateDevice(
-                                    from: discovered,
-                                    customName: customName,
-                                    roomName: roomName,
-                                    manualMAC: manualMAC
-                                )
-                            } else {
-                                bleManager.addManualDevice(
-                                    name: customName,
-                                    roomName: roomName,
-                                    macAddress: manualMAC
-                                )
-                            }
-                            bleManager.stopScanning()
-                            dismiss()
-                        } label: {
-                            HStack {
-                                Spacer()
-                                Label(
-                                    selectedDiscovered != nil ? "绑定并极速直连 (\(selectedDiscovered!.name))" : "按 MAC 地址添加设备",
-                                    systemImage: "checkmark.circle.fill"
-                                )
-                                .font(.subheadline.weight(.semibold))
-                                Spacer()
-                            }
-                        }
-                        .tint(.blue)
-                    } label: {
-                        Label(
-                            selectedDiscovered != nil ? "确认绑定：\(selectedDiscovered!.name)" : "已知硬件 MAC 地址？手动直接添加",
-                            systemImage: "keyboard.badge.ellipsis"
-                        )
-                        .font(.subheadline.weight(.medium))
+                // 3. 绑定确认与手动输入 MAC Section
+                Section("绑定参数确认 / 手动添加") {
+                    LabeledContent("设备名称") {
+                        TextField("例如：主卧电热毯", text: $customName)
+                            .multilineTextAlignment(.trailing)
                     }
-                } header: {
-                    Text("设备配置与手动添加")
+                    LabeledContent("所属房间") {
+                        TextField("例如：主卧", text: $roomName)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    LabeledContent("硬件 MAC") {
+                        TextField("8E:B2:D6:64:F8:60", text: $manualMAC)
+                            .font(.system(.body, design: .monospaced))
+                            .multilineTextAlignment(.trailing)
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled()
+                    }
+
+                    Button {
+                        if let discovered = selectedDiscovered {
+                            bleManager.addOrUpdateDevice(
+                                from: discovered,
+                                customName: customName,
+                                roomName: roomName,
+                                manualMAC: manualMAC
+                            )
+                        } else {
+                            bleManager.addManualDevice(
+                                name: customName,
+                                roomName: roomName,
+                                macAddress: manualMAC
+                            )
+                        }
+                        bleManager.stopScanning()
+                        dismiss()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            Label(
+                                selectedDiscovered != nil ? "绑定并直连 (\(selectedDiscovered!.name))" : "按 MAC 地址保存设备",
+                                systemImage: "checkmark.circle.fill"
+                            )
+                            .fontWeight(.semibold)
+                            Spacer()
+                        }
+                    }
+                    .buttonStyle(.glassProminent)
                 }
             }
             .listStyle(.insetGrouped)
-            .navigationTitle("添加蓝牙电热毯")
+            .navigationTitle("扫描蓝牙电热毯")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("完成") {
+                    Button("关闭") {
                         bleManager.stopScanning()
                         dismiss()
                     }
