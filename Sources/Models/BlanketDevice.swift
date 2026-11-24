@@ -19,7 +19,7 @@ public enum BLEConnectionPolicy: String, Codable, CaseIterable, Identifiable, Se
         case .smartInstantWake:
             return "操作或打开页面时 0.15 秒极速直连；关机闲置 10 分钟后自动休眠省电"
         case .continuous:
-            return "始终维持 BLE 连接并每 25 秒静默同步物理线控器状态"
+            return "始终维持 BLE 连接并每 15 秒静默同步物理线控器状态"
         }
     }
 }
@@ -34,6 +34,61 @@ public enum DeviceConnectionPhase: String, Codable, Sendable {
     public var isReady: Bool {
         self == .connected
     }
+}
+
+/// 单次电热毯开启运行历史记录条目（用于统计本周/本月时长、各挡位时长与绘制历史图表）
+public struct BlanketUsageRecord: Identifiable, Codable, Hashable, Sendable {
+    public var id: UUID
+    public var startDate: Date
+    public var endDate: Date
+    public var durationSeconds: TimeInterval
+    public var primaryGear: Int
+    public var mode: BlanketHeatingMode
+
+    public init(
+        id: UUID = UUID(),
+        startDate: Date,
+        endDate: Date,
+        durationSeconds: TimeInterval,
+        primaryGear: Int,
+        mode: BlanketHeatingMode = .normal
+    ) {
+        self.id = id
+        self.startDate = startDate
+        self.endDate = endDate
+        self.durationSeconds = max(0, durationSeconds)
+        self.primaryGear = min(9, max(1, primaryGear))
+        self.mode = mode
+    }
+}
+
+/// 运行记录清除范围选项
+public enum UsageHistoryClearScope: String, CaseIterable, Identifiable, Sendable {
+    case today = "仅清除今天"
+    case last7Days = "最近 7 天"
+    case last30Days = "最近 30 天"
+    case customRange = "自定义日期时间范围"
+    case allHistory = "清除全部运行数据"
+
+    public var id: String { rawValue }
+}
+
+/// 每日运行时长图表数据点
+public struct DailyUsageChartPoint: Identifiable, Hashable, Sendable {
+    public var id: Date { date }
+    public let date: Date
+    public let label: String
+    public let hours: Double
+    public let dominantGear: Int
+}
+
+/// 各挡位累计运行时间统计条目
+public struct GearUsageRankItem: Identifiable, Hashable, Sendable {
+    public var id: Int { gear }
+    public let gear: Int
+    public let seconds: TimeInterval
+    public let hours: Double
+    public let percentage: Double
 }
 
 /// 持久化保存的电热毯设备实体与实时运行状态模型
@@ -59,12 +114,12 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
     public var timeCloseHours: Int
     /// 预约定时开机（小时，0~12，0 表示未启用）
     public var timeOpenHours: Int
-    /// 剩余预约开机秒数（硬件上报 + 本地秒级平滑推算）
+    /// 剩余预约开机秒数（硬件上报 + 本地平滑推算）
     public var remainingTimeOpenSec: Int
-    /// 剩余自动关机秒数（硬件上报 + 本地秒级平滑推算）
+    /// 剩余自动关机秒数（硬件上报 + 本地平滑推算）
     public var remainingTimeCloseSec: Int
 
-    // MARK: - 偏好记忆与智能策略 (参考 ha_mqtt_bridge.py)
+    // MARK: - 偏好记忆与智能策略
     /// 是否启用双温区同步调节
     public var syncDualZones: Bool
     /// 开机时是否自动恢复上次记忆的左右温区挡位与定时（避开硬件默认重置为 9 挡 / 12h）
@@ -78,13 +133,19 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
     /// 蓝牙连接策略
     public var connectionPolicy: BLEConnectionPolicy
 
-    // MARK: - 运行时长统计与状态遥测 (Requirement 5)
-    /// 本次开机时间戳（用于精确计算“当前已经开启了多少小时/分钟”）
+    // MARK: - 运行时长统计与多维遥测记录 (Requirement 5 & Requirement 7)
+    /// 本次开机时间戳
     public var currentSessionStartDate: Date?
     /// 历史累计开启总秒数（跨会话持久化累计）
     public var accumulatedRuntimeSeconds: TimeInterval
     /// 历史累计开机次数
     public var totalPowerOnCount: Int
+    /// 历史每次开启会话记录明细（用于统计本周/本月运行时长、绘制图表与按日期范围清除）
+    public var usageRecords: [BlanketUsageRecord]
+    /// 各挡位 (1~9) 累计运行秒数统计
+    public var gearUsageSeconds: [Int: TimeInterval]
+    /// 累计除螨模式运行次数
+    public var totalMiteRemovalCount: Int
     /// 最近一次状态同步时间
     public var lastSyncDate: Date?
     /// 最近一次信号强度 (dBm)
@@ -116,6 +177,9 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
         currentSessionStartDate: Date? = nil,
         accumulatedRuntimeSeconds: TimeInterval = 0,
         totalPowerOnCount: Int = 0,
+        usageRecords: [BlanketUsageRecord] = [],
+        gearUsageSeconds: [Int: TimeInterval] = [:],
+        totalMiteRemovalCount: Int = 0,
         lastSyncDate: Date? = nil,
         lastRSSI: Int? = nil,
         lastCommandLatencyMs: Int? = nil
@@ -143,9 +207,47 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
         self.currentSessionStartDate = currentSessionStartDate
         self.accumulatedRuntimeSeconds = accumulatedRuntimeSeconds
         self.totalPowerOnCount = totalPowerOnCount
+        self.usageRecords = usageRecords
+        self.gearUsageSeconds = gearUsageSeconds
+        self.totalMiteRemovalCount = totalMiteRemovalCount
         self.lastSyncDate = lastSyncDate
         self.lastRSSI = lastRSSI
         self.lastCommandLatencyMs = lastCommandLatencyMs
+    }
+
+    // 兼容旧版缓存数据的容错解码
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        peripheralUUIDString = try c.decodeIfPresent(String.self, forKey: .peripheralUUIDString)
+        let rawMac = try c.decodeIfPresent(String.self, forKey: .macAddress) ?? "8E:B2:D6:64:F8:60"
+        macAddress = BlanketProtocol.normalizeMAC(rawMac) ?? rawMac.uppercased()
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? "智能蓝牙电热毯"
+        roomName = try c.decodeIfPresent(String.self, forKey: .roomName) ?? "主卧"
+        advertisedName = try c.decodeIfPresent(String.self, forKey: .advertisedName) ?? "JH_5700_F860"
+        isOn = try c.decodeIfPresent(Bool.self, forKey: .isOn) ?? false
+        mode = try c.decodeIfPresent(BlanketHeatingMode.self, forKey: .mode) ?? .normal
+        gearLeft = try c.decodeIfPresent(Int.self, forKey: .gearLeft) ?? 5
+        gearRight = try c.decodeIfPresent(Int.self, forKey: .gearRight) ?? 5
+        timeCloseHours = try c.decodeIfPresent(Int.self, forKey: .timeCloseHours) ?? 8
+        timeOpenHours = try c.decodeIfPresent(Int.self, forKey: .timeOpenHours) ?? 0
+        remainingTimeOpenSec = try c.decodeIfPresent(Int.self, forKey: .remainingTimeOpenSec) ?? 0
+        remainingTimeCloseSec = try c.decodeIfPresent(Int.self, forKey: .remainingTimeCloseSec) ?? 0
+        syncDualZones = try c.decodeIfPresent(Bool.self, forKey: .syncDualZones) ?? false
+        restoreMemoryOnPowerOn = try c.decodeIfPresent(Bool.self, forKey: .restoreMemoryOnPowerOn) ?? true
+        savedGearLeft = try c.decodeIfPresent(Int.self, forKey: .savedGearLeft) ?? 5
+        savedGearRight = try c.decodeIfPresent(Int.self, forKey: .savedGearRight) ?? 5
+        savedTimeCloseHours = try c.decodeIfPresent(Int.self, forKey: .savedTimeCloseHours) ?? 8
+        connectionPolicy = try c.decodeIfPresent(BLEConnectionPolicy.self, forKey: .connectionPolicy) ?? .smartInstantWake
+        currentSessionStartDate = try c.decodeIfPresent(Date.self, forKey: .currentSessionStartDate)
+        accumulatedRuntimeSeconds = try c.decodeIfPresent(TimeInterval.self, forKey: .accumulatedRuntimeSeconds) ?? 0
+        totalPowerOnCount = try c.decodeIfPresent(Int.self, forKey: .totalPowerOnCount) ?? 0
+        usageRecords = try c.decodeIfPresent([BlanketUsageRecord].self, forKey: .usageRecords) ?? []
+        gearUsageSeconds = try c.decodeIfPresent([Int: TimeInterval].self, forKey: .gearUsageSeconds) ?? [:]
+        totalMiteRemovalCount = try c.decodeIfPresent(Int.self, forKey: .totalMiteRemovalCount) ?? 0
+        lastSyncDate = try c.decodeIfPresent(Date.self, forKey: .lastSyncDate)
+        lastRSSI = try c.decodeIfPresent(Int.self, forKey: .lastRSSI)
+        lastCommandLatencyMs = try c.decodeIfPresent(Int.self, forKey: .lastCommandLatencyMs)
     }
 
     // MARK: - 派生温度与运行时长计算属性
@@ -159,10 +261,9 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
         BlanketProtocol.gearToTemp(gearRight)
     }
 
-    /// 当前会话已开启的秒数（优先结合硬件倒计时差值与本地开机时间戳，确保物理线控开机也能准确推算）
+    /// 当前会话已开启的秒数（优先结合硬件倒计时差值与本地开机时间戳）
     public func currentSessionElapsedSeconds(at now: Date = Date()) -> Int {
         guard isOn else { return 0 }
-        // 如果硬件上报了剩余关机秒数，且小于设定的总关机秒数，可交叉校准已开启时长
         let totalCloseSec = max(1, timeCloseHours) * 3600
         let hardwareElapsedSec = (remainingTimeCloseSec > 0 && remainingTimeCloseSec <= totalCloseSec)
             ? (totalCloseSec - remainingTimeCloseSec)
@@ -175,7 +276,7 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
         return hardwareElapsedSec
     }
 
-    /// 当前会话已开启的小时数（保留 1 位小数，如 `2.4 小时`）
+    /// 当前会话已开启的小时数描述
     public func currentSessionElapsedHoursString(at now: Date = Date()) -> String {
         let sec = currentSessionElapsedSeconds(at: now)
         guard sec > 0 else { return isOn ? "刚刚开启 (<1 分钟)" : "未开启 (0.0 小时)" }
@@ -208,6 +309,152 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
         return totalSec / 3600.0
     }
 
+    // MARK: - 多维统计分析：本周运行时长、本月运行时长、挡位排行榜与每日图表 (Requirement 7)
+
+    /// 本周累计运行小时数（含当前进行中的会话）
+    public func weeklyRuntimeHours(at now: Date = Date()) -> Double {
+        let calendar = Calendar.current
+        let startOfWeek = calendar.dateInterval(of: .weekOfYear, for: now)?.start
+            ?? calendar.date(byAdding: .day, value: -7, to: now)
+            ?? now
+        let recordedSec = usageRecords
+            .filter { $0.endDate >= startOfWeek }
+            .reduce(0.0) { $0 + $1.durationSeconds }
+        let activeSec = isOn ? Double(currentSessionElapsedSeconds(at: now)) : 0
+        return (recordedSec + activeSec) / 3600.0
+    }
+
+    /// 本周开启次数
+    public func weeklySessionCount(at now: Date = Date()) -> Int {
+        let calendar = Calendar.current
+        let startOfWeek = calendar.dateInterval(of: .weekOfYear, for: now)?.start
+            ?? calendar.date(byAdding: .day, value: -7, to: now)
+            ?? now
+        let count = usageRecords.filter { $0.endDate >= startOfWeek }.count
+        return count + (isOn ? 1 : 0)
+    }
+
+    /// 本月累计运行小时数（含当前进行中的会话）
+    public func monthlyRuntimeHours(at now: Date = Date()) -> Double {
+        let calendar = Calendar.current
+        let startOfMonth = calendar.dateInterval(of: .month, for: now)?.start
+            ?? calendar.date(byAdding: .day, value: -30, to: now)
+            ?? now
+        let recordedSec = usageRecords
+            .filter { $0.endDate >= startOfMonth }
+            .reduce(0.0) { $0 + $1.durationSeconds }
+        let activeSec = isOn ? Double(currentSessionElapsedSeconds(at: now)) : 0
+        return (recordedSec + activeSec) / 3600.0
+    }
+
+    /// 本月开启次数
+    public func monthlySessionCount(at now: Date = Date()) -> Int {
+        let calendar = Calendar.current
+        let startOfMonth = calendar.dateInterval(of: .month, for: now)?.start
+            ?? calendar.date(byAdding: .day, value: -30, to: now)
+            ?? now
+        let count = usageRecords.filter { $0.endDate >= startOfMonth }.count
+        return count + (isOn ? 1 : 0)
+    }
+
+    /// 单次平均运行小时数
+    public func averageSessionHours(at now: Date = Date()) -> Double {
+        let count = max(1, totalPowerOnCount)
+        guard totalPowerOnCount > 0 || isOn else { return 0 }
+        return totalHistoricalHours(at: now) / Double(count)
+    }
+
+    /// 各挡位 (1~9) 运行时间统计排行（按使用时长降序排列，若均为 0 则按常用挡位排序展示）
+    public func gearUsageRanking(at now: Date = Date()) -> [GearUsageRankItem] {
+        var combined: [Int: TimeInterval] = [:]
+        for g in 1...9 {
+            combined[g] = gearUsageSeconds[g] ?? 0
+        }
+        // 叠加历史记录中尚未合入字典的条目
+        if gearUsageSeconds.isEmpty {
+            for rec in usageRecords {
+                combined[rec.primaryGear, default: 0] += rec.durationSeconds
+            }
+        }
+        // 叠加当前正在运行的会话秒数
+        if isOn {
+            let currentElapsed = TimeInterval(currentSessionElapsedSeconds(at: now))
+            let activeGear = max(gearLeft, gearRight)
+            combined[activeGear, default: 0] += currentElapsed
+        }
+
+        let totalSec = max(1.0, combined.values.reduce(0, +))
+        let hasAnyUsage = combined.values.contains { $0 > 0 }
+
+        let items: [GearUsageRankItem] = (1...9).map { g in
+            let sec = combined[g] ?? 0
+            let pct = hasAnyUsage ? (sec / totalSec) : 0
+            return GearUsageRankItem(
+                gear: g,
+                seconds: sec,
+                hours: sec / 3600.0,
+                percentage: pct
+            )
+        }
+
+        if hasAnyUsage {
+            return items.sorted {
+                if abs($0.seconds - $1.seconds) > 0.5 {
+                    return $0.seconds > $1.seconds
+                }
+                return $0.gear < $1.gear
+            }
+        } else {
+            return items
+        }
+    }
+
+    /// 最常使用的首选挡位
+    public func topFavoriteGear(at now: Date = Date()) -> GearUsageRankItem? {
+        let ranked = gearUsageRanking(at: now)
+        if let first = ranked.first, first.seconds > 0 {
+            return first
+        }
+        return nil
+    }
+
+    /// 生成最近 N 天（如 7 天或 14 天）的每日运行时长图表数据
+    public func dailyUsageChartPoints(days: Int = 7, at now: Date = Date()) -> [DailyUsageChartPoint] {
+        let calendar = Calendar.current
+        let todayStart = calendar.startOfDay(for: now)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = days <= 7 ? "E" : "MM/dd"
+
+        var points: [DailyUsageChartPoint] = []
+        for offset in stride(from: -(days - 1), through: 0, by: 1) {
+            guard let dayStart = calendar.date(byAdding: .day, value: offset, to: todayStart),
+                  let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) else {
+                continue
+            }
+            let dayRecords = usageRecords.filter { $0.endDate >= dayStart && $0.endDate < dayEnd }
+            var daySec = dayRecords.reduce(0.0) { $0 + $1.durationSeconds }
+            var domGear = dayRecords.last?.primaryGear ?? max(gearLeft, gearRight)
+
+            if offset == 0 && isOn {
+                daySec += Double(currentSessionElapsedSeconds(at: now))
+                domGear = max(gearLeft, gearRight)
+            }
+
+            let rawLabel = formatter.string(from: dayStart).replacingOccurrences(of: "周", with: "")
+            let label = (offset == 0 && days <= 7) ? "今日" : rawLabel
+            points.append(
+                DailyUsageChartPoint(
+                    date: dayStart,
+                    label: label,
+                    hours: daySec / 3600.0,
+                    dominantGear: domGear
+                )
+            )
+        }
+        return points
+    }
+
     /// 格式化剩余自动关机时间
     public var formattedRemainingCloseTime: String {
         guard isOn else { return "未启动" }
@@ -219,7 +466,7 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
 
     /// 格式化剩余预约开机时间
     public var formattedRemainingOpenTime: String {
-        guard timeOpenHours > 0 else { return "未设置预约开机" }
+        guard timeOpenHours > 0 else { return "预约开机：关闭" }
         let sec = remainingTimeOpenSec > 0 ? remainingTimeOpenSec : (timeOpenHours * 3600)
         let h = sec / 3600
         let m = (sec % 3600) / 60

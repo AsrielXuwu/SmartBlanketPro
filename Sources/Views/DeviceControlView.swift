@@ -1,9 +1,11 @@
 import SwiftUI
 
 /// 温控中心主视图 (`DeviceControlView`)
-/// 修复顶部大卡片与状态胶囊边缘阴影被 List Section 裁切的问题：
-/// - 采用 iOS 26 原生 `.listSectionMargins(.horizontal, 0)` 将顶部 Section 容器扩展至屏幕全宽，消除 20pt 处的硬裁剪边界
-/// - 在 `GlassEffectContainer` 内部及下方卡片设置 `.padding(.horizontal, 20)` 与充足上下内边距，使所有顶部大卡片左右边缘与下方标准 Section (20pt 边距) 100% 严格对齐，同时外发光阴影在 0~20pt 缓冲带内完整渲染、绝不截断
+/// 严格遵循 Apple iOS 26 / iOS 27 Liquid Glass 设计规范：
+/// 1. 修复上滑收起悬浮按钮时的白底闪烁与滚动卡顿：使用 `.overlay(alignment: .bottom)` + 单一持久化 `Button` 视图标识（绝不在滚动中销毁重建 `_UIGlassEffect` 视图或动态改动 `List` 的 `safeAreaInsets`）
+/// 2. 挡位色彩严格遵循：1~2 挡蓝色 (`.blue`)、3~5 挡绿色 (`.green`)、6~8 挡橙色 (`.orange`)、9 挡与除螨模式红色 (`.red`)，关闭状态 (`!device.isOn`) 无背景着色；待机图标采用区分鲜明的 Apple HIG 语义冷色系
+/// 3. 点击顶部预约开机状态胶囊按钮时，从该按钮原位通过 `.popover` + `.presentationCompactAdaptation(.popover)` 无缝展开拨轮小菜单设置预约开机时间
+/// 4. 移除底部「定时关机与预约开机」下方的横向预设时间按钮排
 public struct DeviceControlView: View {
     @ObservedObject var bleManager: BlanketBLEManager
     let deviceID: UUID
@@ -13,34 +15,28 @@ public struct DeviceControlView: View {
     @State private var currentTime = Date()
     @State private var showingScannerSheet = false
     @State private var isFloatingDockCollapsed = false
+    @State private var showingScheduleOnPopover = false
 
-    private let clockTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
+    /// 15 秒低频时钟刷新（仅用于更新分钟级已开启时长文案，彻底消除每秒触发 List 重排导致的滚动掉帧）
+    private let clockTimer = Timer.publish(every: 15.0, on: .main, in: .common).autoconnect()
 
     public init(bleManager: BlanketBLEManager, deviceID: UUID) {
         self.bleManager = bleManager
         self.deviceID = deviceID
     }
 
-    private var deviceIndex: Int? {
-        bleManager.devices.firstIndex(where: { $0.id == deviceID })
-    }
-
     private var device: BlanketDevice {
-        if let idx = deviceIndex {
-            return bleManager.devices[idx]
-        }
-        return BlanketDevice()
+        bleManager.devices.first(where: { $0.id == deviceID }) ?? BlanketDevice()
     }
 
     private var connectionPhase: DeviceConnectionPhase {
         bleManager.connectionPhase(for: deviceID)
     }
 
-    private var activeTint: Color {
-        LiquidGlassTheme.thermalTint(
-            isOn: device.isOn,
-            mode: device.mode,
-            gear: max(device.gearLeft, device.gearRight)
+    private var dominantGearColor: Color {
+        LiquidGlassTheme.gearColor(
+            for: max(device.gearLeft, device.gearRight),
+            mode: device.mode
         )
     }
 
@@ -59,12 +55,13 @@ public struct DeviceControlView: View {
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
 
-            // MARK: 2. 原生分区挡位调节 Section (iOS 26/27 Liquid Glass Slider & Glass Buttons)
+            // MARK: 2. 原生分区挡位调节 Section
             if device.syncDualZones {
                 Section {
                     nativeZoneGearRow(
                         title: "左右双温区同步挡位",
                         symbol: "bed.double.fill",
+                        iconRole: .dualZone,
                         gear: device.gearLeft,
                         temperature: device.temperatureLeft,
                         onAdjust: { newGear, debounced in
@@ -81,6 +78,7 @@ public struct DeviceControlView: View {
                     nativeZoneGearRow(
                         title: "左温区 (Left)",
                         symbol: "lefthand.raised.fill",
+                        iconRole: .leftZone,
                         gear: device.gearLeft,
                         temperature: device.temperatureLeft,
                         onAdjust: { newGear, debounced in
@@ -95,6 +93,7 @@ public struct DeviceControlView: View {
                     nativeZoneGearRow(
                         title: "右温区 (Right)",
                         symbol: "righthand.raised.fill",
+                        iconRole: .rightZone,
                         gear: device.gearRight,
                         temperature: device.temperatureRight,
                         onAdjust: { newGear, debounced in
@@ -111,6 +110,7 @@ public struct DeviceControlView: View {
                 Picker("工作模式", selection: Binding(
                     get: { device.mode },
                     set: { newMode in
+                        guard newMode != device.mode else { return }
                         Task { @MainActor in
                             await bleManager.setMode(newMode, for: deviceID)
                         }
@@ -123,21 +123,31 @@ public struct DeviceControlView: View {
                 .pickerStyle(.segmented)
                 .sensoryFeedback(.selection, trigger: device.mode)
 
-                if let idx = deviceIndex {
-                    Toggle(
-                        "双温区同步调节",
-                        systemImage: device.syncDualZones ? "link.circle.fill" : "rectangle.split.2x1.fill",
-                        isOn: Binding(
-                            get: { bleManager.devices[idx].syncDualZones },
-                            set: { newValue in
-                                withAnimation(morphAnimation) {
-                                    bleManager.devices[idx].syncDualZones = newValue
-                                }
+                Toggle(
+                    isOn: Binding(
+                        get: { device.syncDualZones },
+                        set: { newValue in
+                            withAnimation(morphAnimation) {
+                                bleManager.binding(for: deviceID, keyPath: \.syncDualZones, default: false).wrappedValue = newValue
                             }
-                        )
+                        }
                     )
-                    .sensoryFeedback(.selection, trigger: device.syncDualZones)
+                ) {
+                    Label {
+                        Text("双温区同步调节")
+                    } icon: {
+                        Image(systemName: device.syncDualZones ? "link.circle.fill" : "rectangle.split.2x1.fill")
+                            .foregroundStyle(
+                                LiquidGlassTheme.iconColor(
+                                    for: .dualZone,
+                                    isOn: device.isOn,
+                                    mode: device.mode,
+                                    gear: device.gearLeft
+                                )
+                            )
+                    }
                 }
+                .sensoryFeedback(.selection, trigger: device.syncDualZones)
             } header: {
                 Text("模式与温区联动")
             } footer: {
@@ -146,20 +156,33 @@ public struct DeviceControlView: View {
                      : "切换「双温区同步调节」时，上方液态玻璃温区舱将自动融合或分离。")
             }
 
-            // MARK: 4. 定时关机与预约定时开机原生拨轮 Section（改为 .pickerStyle(.wheel)，下方一横排时间按钮保持不动）
+            // MARK: 4. 定时关机与预约定时开机原生拨轮 Section（已移除底部横向时间选择按钮排）
             Section {
                 HStack(spacing: 12) {
                     // 左拨轮：自动关机定时 (1~12 小时)
                     VStack(spacing: 4) {
-                        Label("自动关机定时", systemImage: "timer")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
+                        Label {
+                            Text("自动关机定时")
+                        } icon: {
+                            Image(systemName: "timer")
+                                .foregroundStyle(
+                                    LiquidGlassTheme.iconColor(
+                                        for: .autoOffTimer,
+                                        isOn: device.isOn,
+                                        mode: device.mode,
+                                        gear: max(device.gearLeft, device.gearRight)
+                                    )
+                                )
+                        }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
 
                         Picker(
                             "自动关机定时",
                             selection: Binding(
                                 get: { device.timeCloseHours },
                                 set: { newHours in
+                                    guard newHours != device.timeCloseHours else { return }
                                     Task { @MainActor in
                                         await bleManager.setAutoOffHours(newHours, for: deviceID)
                                     }
@@ -182,15 +205,29 @@ public struct DeviceControlView: View {
 
                     // 右拨轮：预约定时开机 (关闭 / 1~12 小时)
                     VStack(spacing: 4) {
-                        Label("预约定时开机", systemImage: "alarm.waves.left.and.right.fill")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
+                        Label {
+                            Text("预约定时开机")
+                        } icon: {
+                            Image(systemName: "alarm.waves.left.and.right.fill")
+                                .foregroundStyle(
+                                    LiquidGlassTheme.iconColor(
+                                        for: .scheduleOnTimer,
+                                        isOn: device.isOn,
+                                        mode: device.mode,
+                                        gear: max(device.gearLeft, device.gearRight),
+                                        hasActiveSchedule: device.timeOpenHours > 0
+                                    )
+                                )
+                        }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
 
                         Picker(
                             "预约定时开机",
                             selection: Binding(
                                 get: { device.timeOpenHours },
                                 set: { newOpenHours in
+                                    guard newOpenHours != device.timeOpenHours else { return }
                                     Task { @MainActor in
                                         await bleManager.setScheduledOnHours(newOpenHours, for: deviceID)
                                     }
@@ -210,34 +247,6 @@ public struct DeviceControlView: View {
                     .frame(maxWidth: .infinity)
                 }
                 .padding(.vertical, 4)
-
-                // 原生 GlassEffectContainer 快捷定时关机按钮组（保持原样一横排时间按钮不动）
-                GlassEffectContainer(spacing: 8) {
-                    HStack(spacing: 8) {
-                        ForEach([2, 4, 6, 8, 10, 12], id: \.self) { preset in
-                            if device.timeCloseHours == preset {
-                                Button("\(preset)h") {
-                                    Task { @MainActor in
-                                        await bleManager.setAutoOffHours(preset, for: deviceID)
-                                    }
-                                }
-                                .buttonStyle(.glassProminent)
-                                .tint(activeTint)
-                                .controlSize(.small)
-                            } else {
-                                Button("\(preset)h") {
-                                    Task { @MainActor in
-                                        await bleManager.setAutoOffHours(preset, for: deviceID)
-                                    }
-                                }
-                                .buttonStyle(.glass)
-                                .controlSize(.small)
-                            }
-                        }
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 2)
-                }
             } header: {
                 Text("定时关机与预约开机")
             } footer: {
@@ -248,7 +257,7 @@ public struct DeviceControlView: View {
             Section("当前运行状态摘要") {
                 LabeledContent("当前状态") {
                     Text(device.isOn ? "正在加热 · \(device.mode.title)" : "已关机待机")
-                        .foregroundStyle(device.isOn ? activeTint : Color.secondary)
+                        .foregroundStyle(device.isOn ? dominantGearColor : Color.secondary)
                         .fontWeight(.medium)
                 }
 
@@ -278,15 +287,37 @@ public struct DeviceControlView: View {
                     }
                 }
             }
+
+            // 底部留白缓冲：确保最后一组卡片可滚出底部悬浮控制坞上方，且无需动态修改 List 的 safeAreaInsets
+            Section {
+                Color.clear
+                    .frame(height: 68)
+            }
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
         }
         .listStyle(.insetGrouped)
-        .animation(morphAnimation, value: device)
-        .onScrollGeometryChange(for: Bool.self) { geometry in
-            (geometry.contentOffset.y + geometry.contentInsets.top) > 36
-        } action: { _, isScrolledUp in
-            withAnimation(morphAnimation) {
-                isFloatingDockCollapsed = isScrolledUp
+        .onScrollGeometryChange(for: Int.self) { geometry in
+            let offset = geometry.contentOffset.y + geometry.contentInsets.top
+            if offset > 46 {
+                return 1
+            } else if offset < 16 {
+                return -1
             }
+            return 0
+        } action: { _, scrollState in
+            if scrollState == 1 && !isFloatingDockCollapsed {
+                withAnimation(.spring(duration: 0.3, bounce: 0.1)) {
+                    isFloatingDockCollapsed = true
+                }
+            } else if scrollState == -1 && isFloatingDockCollapsed {
+                withAnimation(.spring(duration: 0.3, bounce: 0.1)) {
+                    isFloatingDockCollapsed = false
+                }
+            }
+        }
+        .overlay(alignment: .bottom) {
+            floatingLiquidGlassBottomDock
         }
         .navigationTitle(device.name)
         .navigationBarTitleDisplayMode(.large)
@@ -330,9 +361,6 @@ public struct DeviceControlView: View {
                 }
             }
         }
-        .safeAreaInset(edge: .bottom) {
-            floatingLiquidGlassBottomDock
-        }
         .sheet(isPresented: $showingScannerSheet) {
             ScannerSheetView(bleManager: bleManager)
                 .presentationDetents([.medium, .large])
@@ -347,19 +375,20 @@ public struct DeviceControlView: View {
         }
     }
 
-    // MARK: - 顶部双温区拨轮卡片 + 顶部快捷关机定时大卡片 + 独立无粘连状态胶囊
-    /// 配合 Section 的 `.listSectionMargins(.horizontal, 0)`（全屏宽度不裁切），
-    /// 在内部使用标准 `.padding(.horizontal, 20)`，使卡片左右边缘与下方 `.insetGrouped` Section 100% 对齐，且四周留出 16~20pt 阴影渲染空间！
+    // MARK: - 顶部双温区拨轮卡片 + 顶部快捷关机定时大卡片 + 独立无粘连状态胶囊（支持点击预约状态原位展开拨轮小菜单）
     private var liquidGlassMorphingHeroHeader: some View {
-        VStack(spacing: 0) {
-            // 1. 左右温区拨轮大卡片
+        let leftTint = LiquidGlassTheme.activeGlassBackgroundTint(isOn: device.isOn, mode: device.mode, gear: device.gearLeft)
+        let rightTint = LiquidGlassTheme.activeGlassBackgroundTint(isOn: device.isOn, mode: device.mode, gear: device.gearRight)
+
+        return VStack(spacing: 0) {
+            // 1. 左右温区拨轮大卡片（关闭时无背景色，开启时按 1-2蓝/3-5绿/6-8橙/9或除螨红 动态着色）
             GlassEffectContainer(spacing: 6) {
                 Group {
                     if device.syncDualZones {
                         unifiedZoneGlassOrb
                             .glassEffect(
-                                device.isOn
-                                    ? .regular.tint(activeTint).interactive()
+                                leftTint != nil
+                                    ? .regular.tint(leftTint!).interactive()
                                     : .regular.interactive(),
                                 in: .rect(cornerRadius: 26)
                             )
@@ -368,6 +397,7 @@ public struct DeviceControlView: View {
                         HStack(spacing: 14) {
                             singleZoneGlassOrb(
                                 title: "左温区",
+                                iconRole: .leftZone,
                                 gear: device.gearLeft,
                                 temperature: device.temperatureLeft,
                                 onSelectGear: { newGear in
@@ -375,8 +405,8 @@ public struct DeviceControlView: View {
                                 }
                             )
                             .glassEffect(
-                                device.isOn
-                                    ? .regular.tint(LiquidGlassTheme.thermalTint(isOn: true, mode: device.mode, gear: device.gearLeft)).interactive()
+                                leftTint != nil
+                                    ? .regular.tint(leftTint!).interactive()
                                     : .regular.interactive(),
                                 in: .rect(cornerRadius: 24)
                             )
@@ -384,6 +414,7 @@ public struct DeviceControlView: View {
 
                             singleZoneGlassOrb(
                                 title: "右温区",
+                                iconRole: .rightZone,
                                 gear: device.gearRight,
                                 temperature: device.temperatureRight,
                                 onSelectGear: { newGear in
@@ -391,8 +422,8 @@ public struct DeviceControlView: View {
                                 }
                             )
                             .glassEffect(
-                                device.isOn
-                                    ? .regular.tint(LiquidGlassTheme.thermalTint(isOn: true, mode: device.mode, gear: device.gearRight)).interactive()
+                                rightTint != nil
+                                    ? .regular.tint(rightTint!).interactive()
                                     : .regular.interactive(),
                                 in: .rect(cornerRadius: 24)
                             )
@@ -405,60 +436,174 @@ public struct DeviceControlView: View {
                 .padding(.bottom, 14)
             }
 
-            // 2. 顶部快捷关机定时大卡片（四周保留充足阴影空间，左右 20pt 与上方温区及下方组件严格对齐）
+            // 2. 顶部快捷关机定时大卡片
             quickAutoOffTimerHeroCard
                 .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
                 .padding(.horizontal, 20)
                 .padding(.bottom, 14)
 
-            // 3. 待机/已开启状态与预约/定时状态胶囊：独立渲染无玻璃粘连，四周预留阴影缓冲
+            // 3. 待机/已开启状态胶囊 + 可点击展开预约开机拨轮小菜单的预约状态胶囊 (Requirement 4)
             HStack(spacing: 14) {
-                Label(device.compactElapsedString(at: currentTime), systemImage: "clock.fill")
-                    .font(.caption.weight(.semibold).monospacedDigit())
-                    .contentTransition(.numericText())
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .glassEffect(
-                        device.isOn ? .regular.tint(activeTint).interactive() : .regular.interactive(),
-                        in: .capsule
-                    )
-
-                Label(
-                    device.isOn ? device.formattedRemainingCloseTime : device.formattedRemainingOpenTime,
-                    systemImage: device.isOn ? "timer" : "alarm.fill"
-                )
-                .font(.caption.weight(.medium).monospacedDigit())
-                .contentTransition(.numericText())
-                .lineLimit(1)
+                HStack(spacing: 6) {
+                    Image(systemName: device.isOn ? "flame.fill" : "moon.zzz.fill")
+                        .foregroundStyle(
+                            LiquidGlassTheme.iconColor(
+                                for: .standbyClock,
+                                isOn: device.isOn,
+                                mode: device.mode,
+                                gear: max(device.gearLeft, device.gearRight)
+                            )
+                        )
+                    Text(device.compactElapsedString(at: currentTime))
+                        .contentTransition(.numericText())
+                }
+                .font(.caption.weight(.semibold).monospacedDigit())
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)
-                .glassEffect(.regular.interactive(), in: .capsule)
+                .glassEffect(
+                    device.isOn ? .regular.tint(dominantGearColor).interactive() : .regular.interactive(),
+                    in: .capsule
+                )
+
+                // 点击此预约开机状态按钮，从该按钮原位无缝展开拨轮小菜单 (Requirement 4)
+                Button {
+                    showingScheduleOnPopover = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: device.isOn ? "timer" : "alarm.fill")
+                            .foregroundStyle(
+                                LiquidGlassTheme.iconColor(
+                                    for: .scheduleOnTimer,
+                                    isOn: device.isOn,
+                                    mode: device.mode,
+                                    gear: max(device.gearLeft, device.gearRight),
+                                    hasActiveSchedule: device.timeOpenHours > 0
+                                )
+                            )
+                        Text(device.isOn ? device.formattedRemainingCloseTime : device.formattedRemainingOpenTime)
+                            .contentTransition(.numericText())
+                            .lineLimit(1)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .font(.caption.weight(.medium).monospacedDigit())
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .padding(.horizontal, 8)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(
+                    (!device.isOn && device.timeOpenHours > 0)
+                        ? .regular.tint(.teal).interactive()
+                        : .regular.interactive(),
+                    in: .capsule
+                )
+                .popover(
+                    isPresented: $showingScheduleOnPopover,
+                    attachmentAnchor: .rect(.bounds),
+                    arrowEdge: .top
+                ) {
+                    scheduleOnWheelPopoverMenu
+                        .presentationCompactAdaptation(.popover)
+                }
             }
             .padding(.horizontal, 20)
             .padding(.bottom, 18)
         }
     }
 
+    // MARK: - 从顶部预约开机胶囊原位无缝展开的拨轮小菜单 (Requirement 4)
+    private var scheduleOnWheelPopoverMenu: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Label {
+                    Text("预约定时开机")
+                        .font(.subheadline.weight(.semibold))
+                } icon: {
+                    Image(systemName: "alarm.waves.left.and.right.fill")
+                        .foregroundStyle(.teal)
+                }
+                Spacer()
+                Text(device.timeOpenHours == 0 ? "已关闭" : "\(device.timeOpenHours) 小时后")
+                    .font(.caption.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(device.timeOpenHours > 0 ? Color.teal : Color.secondary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
+
+            Picker(
+                "预约定时开机",
+                selection: Binding(
+                    get: { device.timeOpenHours },
+                    set: { newHours in
+                        guard newHours != device.timeOpenHours else { return }
+                        Task { @MainActor in
+                            await bleManager.setScheduledOnHours(newHours, for: deviceID)
+                        }
+                    }
+                )
+            ) {
+                Text("关闭预约").tag(0)
+                ForEach(1...12, id: \.self) { h in
+                    Text("\(h) 小时后自动开机").tag(h)
+                }
+            }
+            .pickerStyle(.wheel)
+            .frame(width: 230, height: 132)
+            .clipped()
+            .sensoryFeedback(.selection, trigger: device.timeOpenHours)
+
+            HStack {
+                Text("上下滑动拨轮即可实时下发预约")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("完成") {
+                    showingScheduleOnPopover = false
+                }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.glass)
+                .controlSize(.mini)
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 10)
+        }
+        .frame(width: 256)
+    }
+
     // MARK: - 单温区液态玻璃卡片（右上角显示温度 °C，中央为原生拨轮滚动调节挡位）
     private func singleZoneGlassOrb(
         title: String,
+        iconRole: LiquidGlassTheme.SemanticIconRole,
         gear: Int,
         temperature: Int,
         onSelectGear: @escaping (Int) -> Void
     ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            // 顶栏：左侧温区名，右上角实时标称温度 °C
-            HStack {
+        let gearTint = LiquidGlassTheme.gearColor(for: gear, mode: device.mode)
+
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(
+                        LiquidGlassTheme.iconColor(
+                            for: iconRole,
+                            isOn: device.isOn,
+                            mode: device.mode,
+                            gear: gear
+                        )
+                    )
+                    .frame(width: 7, height: 7)
                 Text(title)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
                 Text("\(temperature)°C")
                     .font(.subheadline.weight(.bold).monospacedDigit())
+                    .foregroundStyle(device.isOn ? .primary : gearTint)
                     .contentTransition(.numericText())
             }
 
-            // 中部主视觉：原生 SwiftUI 拨轮组件 (.pickerStyle(.wheel))，直接上下滑动挡位数字即可调挡
             Picker(
                 title,
                 selection: Binding(
@@ -474,6 +619,7 @@ public struct DeviceControlView: View {
                     HStack(alignment: .firstTextBaseline, spacing: 3) {
                         Text("\(step)")
                             .font(.system(size: 32, weight: .bold, design: .rounded).monospacedDigit())
+                            .foregroundStyle(device.isOn ? Color.primary : LiquidGlassTheme.gearColor(for: step, mode: device.mode))
                         Text("挡")
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.secondary)
@@ -486,11 +632,10 @@ public struct DeviceControlView: View {
             .clipped()
             .sensoryFeedback(.selection, trigger: gear)
 
-            // 底栏：舒适度语义提示
             HStack {
-                Text(device.isOn ? LiquidGlassTheme.gearComfortLabel(gear) : "滑动数字即刻调挡")
+                Text(LiquidGlassTheme.gearComfortLabel(gear))
                     .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(device.isOn ? .secondary : gearTint)
                 Spacer()
                 Image(systemName: "chevron.up.chevron.down")
                     .font(.caption2)
@@ -502,22 +647,32 @@ public struct DeviceControlView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // MARK: - 双区同步液态玻璃卡片（右上角显示温度 °C，中央为原生拨轮滚动调节挡位）
+    // MARK: - 双区同步液态玻璃卡片
     private var unifiedZoneGlassOrb: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let gearTint = LiquidGlassTheme.gearColor(for: device.gearLeft, mode: device.mode)
+
+        return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 HStack(spacing: 6) {
                     Image(systemName: "link.circle.fill")
+                        .foregroundStyle(
+                            LiquidGlassTheme.iconColor(
+                                for: .dualZone,
+                                isOn: device.isOn,
+                                mode: device.mode,
+                                gear: device.gearLeft
+                            )
+                        )
                     Text("左右双温区同步恒温")
                         .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
                 }
-                .foregroundStyle(.secondary)
 
                 Spacer()
 
-                // 右上角显示温度
                 Text("\(device.temperatureLeft)°C")
                     .font(.title3.weight(.bold).monospacedDigit())
+                    .foregroundStyle(device.isOn ? .primary : gearTint)
                     .contentTransition(.numericText())
             }
 
@@ -547,6 +702,7 @@ public struct DeviceControlView: View {
                         HStack(alignment: .firstTextBaseline, spacing: 3) {
                             Text("\(step)")
                                 .font(.system(size: 34, weight: .bold, design: .rounded).monospacedDigit())
+                                .foregroundStyle(device.isOn ? Color.primary : LiquidGlassTheme.gearColor(for: step, mode: device.mode))
                             Text("挡")
                                 .font(.subheadline.weight(.semibold))
                                 .foregroundStyle(.secondary)
@@ -565,30 +721,57 @@ public struct DeviceControlView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // MARK: - 顶部新增：快捷关机定时大卡片
+    // MARK: - 顶部快捷关机定时大卡片
     private var quickAutoOffTimerHeroCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Label("快捷关机定时", systemImage: "timer.circle.fill")
-                    .font(.subheadline.weight(.semibold))
+                Label {
+                    Text("快捷关机定时")
+                        .font(.subheadline.weight(.semibold))
+                } icon: {
+                    Image(systemName: "timer.circle.fill")
+                        .foregroundStyle(
+                            LiquidGlassTheme.iconColor(
+                                for: .autoOffTimer,
+                                isOn: device.isOn,
+                                mode: device.mode,
+                                gear: max(device.gearLeft, device.gearRight)
+                            )
+                        )
+                }
                 Spacer()
                 Text(device.isOn ? device.formattedRemainingCloseTime : "当前设定 \(device.timeCloseHours) 小时")
                     .font(.caption.weight(.semibold).monospacedDigit())
-                    .foregroundStyle(device.isOn ? activeTint : Color.secondary)
+                    .foregroundStyle(device.isOn ? dominantGearColor : Color.secondary)
                     .contentTransition(.numericText())
             }
 
             HStack(spacing: 8) {
                 ForEach([1, 2, 4, 6, 8, 12], id: \.self) { hours in
                     if device.timeCloseHours == hours {
-                        Button("\(hours)h") {
-                            Task { @MainActor in
-                                await bleManager.setAutoOffHours(hours, for: deviceID)
+                        if device.isOn {
+                            Button("\(hours)h") {
+                                Task { @MainActor in
+                                    await bleManager.setAutoOffHours(hours, for: deviceID)
+                                }
                             }
+                            .buttonStyle(.glassProminent)
+                            .tint(dominantGearColor)
+                            .controlSize(.small)
+                        } else {
+                            // 关闭状态下不填充彩色背景色，仅高亮文字与图标
+                            Button {
+                                Task { @MainActor in
+                                    await bleManager.setAutoOffHours(hours, for: deviceID)
+                                }
+                            } label: {
+                                Text("\(hours)h")
+                                    .fontWeight(.bold)
+                                    .foregroundStyle(.indigo)
+                            }
+                            .buttonStyle(.glass)
+                            .controlSize(.small)
                         }
-                        .buttonStyle(.glassProminent)
-                        .tint(activeTint)
-                        .controlSize(.small)
                     } else {
                         Button("\(hours)h") {
                             Task { @MainActor in
@@ -607,33 +790,38 @@ public struct DeviceControlView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // MARK: - 原生温区滑块与快捷步进控件 (iOS 26/27 Native Slider + .buttonStyle(.glass))
+    // MARK: - 原生温区滑块与快捷步进控件 (1-2蓝 / 3-5绿 / 6-8橙 / 9或除螨红；关闭时按钮无背景色)
     private func nativeZoneGearRow(
         title: String,
         symbol: String,
+        iconRole: LiquidGlassTheme.SemanticIconRole,
         gear: Int,
         temperature: Int,
         onAdjust: @escaping (Int, Bool) -> Void
     ) -> some View {
-        let zoneColor = LiquidGlassTheme.thermalTint(isOn: true, mode: device.mode, gear: gear)
+        let zoneColor = LiquidGlassTheme.gearColor(for: gear, mode: device.mode)
+        let iconTint = LiquidGlassTheme.iconColor(for: iconRole, isOn: device.isOn, mode: device.mode, gear: gear)
 
         return VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Label(title, systemImage: symbol)
-                    .font(.headline)
+                Label {
+                    Text(title)
+                        .font(.headline)
+                } icon: {
+                    Image(systemName: symbol)
+                        .foregroundStyle(iconTint)
+                }
                 Spacer()
                 Text("\(gear) 挡 · \(temperature)°C (\(LiquidGlassTheme.gearComfortLabel(gear)))")
                     .font(.subheadline.weight(.semibold).monospacedDigit())
-                    .foregroundStyle(device.isOn ? zoneColor : Color.secondary)
+                    .foregroundStyle(zoneColor)
                     .contentTransition(.numericText())
             }
 
             HStack(spacing: 12) {
                 Button {
                     guard gear > 1 else { return }
-                    withAnimation(morphAnimation) {
-                        onAdjust(gear - 1, false)
-                    }
+                    onAdjust(gear - 1, false)
                 } label: {
                     Image(systemName: "minus")
                         .frame(width: 14, height: 14)
@@ -642,16 +830,13 @@ public struct DeviceControlView: View {
                 .buttonBorderShape(.circle)
                 .disabled(gear <= 1)
 
-                // iOS 26/27 原生液态水滴滑块
                 Slider(
                     value: Binding(
                         get: { Double(gear) },
                         set: { newVal in
                             let target = Int(round(newVal))
                             if target != gear {
-                                withAnimation(morphAnimation) {
-                                    onAdjust(target, true)
-                                }
+                                onAdjust(target, true)
                             }
                         }
                     ),
@@ -663,9 +848,7 @@ public struct DeviceControlView: View {
 
                 Button {
                     guard gear < 9 else { return }
-                    withAnimation(morphAnimation) {
-                        onAdjust(gear + 1, false)
-                    }
+                    onAdjust(gear + 1, false)
                 } label: {
                     Image(systemName: "plus")
                         .frame(width: 14, height: 14)
@@ -675,24 +858,36 @@ public struct DeviceControlView: View {
                 .disabled(gear >= 9)
             }
 
-            // 1 / 3 / 5 / 7 / 9 常用挡位原生 Glass 快捷点选行
+            // 1 / 3 / 5 / 7 / 9 常用挡位原生 Glass 快捷点选行（每个挡位展示对应蓝/绿/橙/红色彩，关闭时无背景色）
             GlassEffectContainer(spacing: 8) {
                 HStack(spacing: 8) {
                     ForEach([1, 3, 5, 7, 9], id: \.self) { step in
+                        let stepColor = LiquidGlassTheme.gearColor(for: step, mode: device.mode)
                         if gear == step {
-                            Button("\(step)挡 · \(BlanketProtocol.gearToTemp(step))°") {
-                                withAnimation(morphAnimation) {
+                            if device.isOn {
+                                Button("\(step)挡 · \(BlanketProtocol.gearToTemp(step))°") {
                                     onAdjust(step, false)
                                 }
+                                .buttonStyle(.glassProminent)
+                                .tint(stepColor)
+                                .controlSize(.small)
+                            } else {
+                                Button {
+                                    onAdjust(step, false)
+                                } label: {
+                                    Text("\(step)挡 · \(BlanketProtocol.gearToTemp(step))°")
+                                        .fontWeight(.bold)
+                                        .foregroundStyle(stepColor)
+                                }
+                                .buttonStyle(.glass)
+                                .controlSize(.small)
                             }
-                            .buttonStyle(.glassProminent)
-                            .tint(zoneColor)
-                            .controlSize(.small)
                         } else {
-                            Button("\(step)挡") {
-                                withAnimation(morphAnimation) {
-                                    onAdjust(step, false)
-                                }
+                            Button {
+                                onAdjust(step, false)
+                            } label: {
+                                Text("\(step)挡")
+                                    .foregroundStyle(stepColor)
                             }
                             .buttonStyle(.glass)
                             .controlSize(.small)
@@ -705,7 +900,9 @@ public struct DeviceControlView: View {
         .padding(.vertical, 6)
     }
 
-    // MARK: - 底部悬浮 Liquid Glass 快捷控制坞（上滑列表时自动收起成纯圆形图标按钮、隐藏文字显示）
+    // MARK: - 底部悬浮 Liquid Glass 快捷控制坞
+    /// 【修复白底闪烁与掉帧】：保持每个按钮为单一持久化 View 实例（绝不用 if/else 分支销毁重建 _UIGlassEffect 视图），
+    /// 仅在同一按钮内部平滑收起文字，因此底层液态玻璃材质层始终常驻，0 白闪、120Hz 满帧丝滑过渡！
     private var floatingLiquidGlassBottomDock: some View {
         GlassEffectContainer(spacing: 12) {
             HStack(spacing: 10) {
@@ -713,93 +910,93 @@ public struct DeviceControlView: View {
                     Spacer(minLength: 0)
                 }
 
-                // 1. 开关电热毯悬浮按钮（上滑时收起为纯圆形按钮并隐藏文字）
-                if isFloatingDockCollapsed {
-                    Button {
-                        Task { @MainActor in
-                            await bleManager.setPower(isOn: !device.isOn, for: deviceID)
-                        }
-                    } label: {
+                // 1. 开关电热毯悬浮按钮（单一持久化视图，关闭时无彩色背景，开启时按当前挡位/模式显色）
+                Button {
+                    Task { @MainActor in
+                        await bleManager.setPower(isOn: !device.isOn, for: deviceID)
+                    }
+                } label: {
+                    HStack(spacing: isFloatingDockCollapsed ? 0 : 6) {
                         Image(systemName: "power")
                             .font(.title3.weight(.semibold))
-                            .padding(6)
-                    }
-                    .buttonStyle(.glassProminent)
-                    .buttonBorderShape(.circle)
-                    .tint(device.isOn ? activeTint : .blue)
-                    .sensoryFeedback(.impact(weight: .heavy), trigger: device.isOn)
-                    .accessibilityLabel(device.isOn ? "关闭电热毯" : "开启电热毯")
-                } else {
-                    Button {
-                        Task { @MainActor in
-                            await bleManager.setPower(isOn: !device.isOn, for: deviceID)
+                            .foregroundStyle(device.isOn ? Color.white : Color.primary)
+                        if !isFloatingDockCollapsed {
+                            Text(device.isOn ? "关闭电热毯" : "开启电热毯")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(device.isOn ? Color.white : Color.primary)
+                                .lineLimit(1)
                         }
-                    } label: {
-                        Label(
-                            device.isOn ? "关闭电热毯" : "开启电热毯",
-                            systemImage: "power"
-                        )
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 4)
                     }
-                    .buttonStyle(.glassProminent)
-                    .tint(device.isOn ? activeTint : .blue)
-                    .sensoryFeedback(.impact(weight: .heavy), trigger: device.isOn)
+                    .frame(maxWidth: isFloatingDockCollapsed ? nil : .infinity)
+                    .padding(.vertical, isFloatingDockCollapsed ? 6 : 4)
+                    .padding(.horizontal, isFloatingDockCollapsed ? 6 : 8)
                 }
+                .buttonStyle(.glassProminent)
+                .buttonBorderShape(.capsule)
+                .tint(device.isOn ? dominantGearColor : Color.secondary.opacity(0.22))
+                .sensoryFeedback(.impact(weight: .heavy), trigger: device.isOn)
+                .accessibilityLabel(device.isOn ? "关闭电热毯" : "开启电热毯")
 
-                // 2. 切换除螨模式悬浮按钮（上滑时同样收起为纯圆形按钮并隐藏文字）
-                if isFloatingDockCollapsed {
-                    Button {
-                        let nextMode: BlanketHeatingMode = (device.mode == .miteRemoval) ? .normal : .miteRemoval
-                        Task { @MainActor in
-                            await bleManager.setMode(nextMode, for: deviceID)
-                        }
-                    } label: {
+                // 2. 切换除螨模式悬浮按钮（单一持久化视图，除螨开启时为红色，关闭时无背景色）
+                Button {
+                    let nextMode: BlanketHeatingMode = (device.mode == .miteRemoval) ? .normal : .miteRemoval
+                    Task { @MainActor in
+                        await bleManager.setMode(nextMode, for: deviceID)
+                    }
+                } label: {
+                    HStack(spacing: isFloatingDockCollapsed ? 0 : 6) {
                         Image(systemName: "sparkles")
                             .font(.title3)
-                            .padding(6)
-                    }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.circle)
-                    .tint(device.mode == .miteRemoval ? Color.red : Color.primary)
-                    .accessibilityLabel("切换除螨模式")
-                } else {
-                    Button {
-                        let nextMode: BlanketHeatingMode = (device.mode == .miteRemoval) ? .normal : .miteRemoval
-                        Task { @MainActor in
-                            await bleManager.setMode(nextMode, for: deviceID)
+                            .foregroundStyle(
+                                (device.isOn && device.mode == .miteRemoval)
+                                    ? Color.red
+                                    : Color.primary
+                            )
+                        if !isFloatingDockCollapsed {
+                            Text(device.mode == .miteRemoval ? "除螨中" : "除螨")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(
+                                    (device.isOn && device.mode == .miteRemoval)
+                                        ? Color.red
+                                        : Color.primary
+                                )
+                                .lineLimit(1)
                         }
-                    } label: {
-                        Label(
-                            device.mode == .miteRemoval ? "除螨中" : "除螨",
-                            systemImage: "sparkles"
-                        )
-                        .font(.subheadline.weight(.medium))
-                        .padding(.vertical, 4)
                     }
-                    .buttonStyle(.glass)
-                    .tint(device.mode == .miteRemoval ? Color.red : Color.primary)
+                    .padding(.vertical, isFloatingDockCollapsed ? 6 : 4)
+                    .padding(.horizontal, isFloatingDockCollapsed ? 6 : 8)
                 }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.capsule)
+                .tint((device.isOn && device.mode == .miteRemoval) ? Color.red : Color.primary)
+                .accessibilityLabel("切换除螨模式")
 
-                // 3. 一键切换双区同步液态玻璃圆钮 (.buttonStyle(.glass))
-                if let idx = deviceIndex {
-                    Button {
-                        withAnimation(morphAnimation) {
-                            bleManager.devices[idx].syncDualZones.toggle()
-                        }
-                    } label: {
-                        Image(systemName: device.syncDualZones ? "link.circle.fill" : "rectangle.split.2x1")
-                            .font(.title3)
-                            .padding(isFloatingDockCollapsed ? 6 : 4)
+                // 3. 一键切换双区同步液态玻璃圆钮
+                Button {
+                    withAnimation(morphAnimation) {
+                        let current = device.syncDualZones
+                        bleManager.binding(for: deviceID, keyPath: \.syncDualZones, default: false).wrappedValue = !current
                     }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.circle)
-                    .accessibilityLabel("切换双温区同步")
+                } label: {
+                    Image(systemName: device.syncDualZones ? "link.circle.fill" : "rectangle.split.2x1")
+                        .font(.title3)
+                        .foregroundStyle(
+                            LiquidGlassTheme.iconColor(
+                                for: .dualZone,
+                                isOn: device.isOn,
+                                mode: device.mode,
+                                gear: device.gearLeft
+                            )
+                        )
+                        .padding(isFloatingDockCollapsed ? 6 : 4)
                 }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .accessibilityLabel("切换双温区同步")
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+            .padding(.top, 6)
+            .padding(.bottom, 8)
         }
     }
 }
