@@ -444,7 +444,7 @@ public struct DeviceControlView: View {
 
             // 2. 顶部快捷关机定时大卡片
             quickAutoOffTimerHeroCard
-                .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
+                .glassEffect(.regular, in: .rect(cornerRadius: 24))
                 .padding(.horizontal, 20)
                 .padding(.bottom, 14)
 
@@ -467,7 +467,7 @@ public struct DeviceControlView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)
                 .glassEffect(
-                    device.isOn ? .regular.tint(dominantGearColor).interactive() : .regular.interactive(),
+                    device.isOn ? .regular.tint(dominantGearColor) : .regular,
                     in: .capsule
                 )
 

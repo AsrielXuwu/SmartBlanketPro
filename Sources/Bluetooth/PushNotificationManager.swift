@@ -182,29 +182,33 @@ public final class PushNotificationManager: NSObject, UIApplicationDelegate, UNU
 
     /// 在 App 退入后台断连蓝牙前，根据当前硬件剩余定时秒数预埋精准的到点状态通知（预约开机 / 自动关机）
     public func scheduleBackgroundHardwareTimerNotifications(for device: BlanketDevice) {
-        let center = UNUserNotificationCenter.current()
-        let closeID = "timer_close_\(device.id.uuidString)"
-        let openID = "timer_open_\(device.id.uuidString)"
-        center.removePendingNotificationRequests(withIdentifiers: [closeID, openID])
+        let enabled = enableStatusPushNotifications
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            let center = UNUserNotificationCenter.current()
+            let closeID = "timer_close_\(device.id.uuidString)"
+            let openID = "timer_open_\(device.id.uuidString)"
+            center.removePendingNotificationRequests(withIdentifiers: [closeID, openID])
 
-        guard enableStatusPushNotifications else { return }
+            guard enabled else { return }
 
-        if device.isOn && device.remainingTimeCloseSec > 5 {
-            scheduleSystemNotification(
-                title: "❄️ \(device.name) 已到点自动关机",
-                body: "设定的 \(device.timeCloseHours) 小时自动关机定时已完成，电热毯已安全停止加热。",
-                delay: TimeInterval(device.remainingTimeCloseSec),
-                identifier: closeID
-            )
-        }
+            if device.isOn && device.remainingTimeCloseSec > 5 {
+                self.scheduleSystemNotification(
+                    title: "❄️ \(device.name) 已到点自动关机",
+                    body: "设定的 \(device.timeCloseHours) 小时自动关机定时已完成，电热毯已安全停止加热。",
+                    delay: TimeInterval(device.remainingTimeCloseSec),
+                    identifier: closeID
+                )
+            }
 
-        if !device.isOn && device.timeOpenHours > 0 && device.remainingTimeOpenSec > 5 {
-            scheduleSystemNotification(
-                title: "🔥 \(device.name) 预约定时开机已启动",
-                body: "预约的 \(device.timeOpenHours) 小时开机时间已到，电热毯已开始为您暖被。",
-                delay: TimeInterval(device.remainingTimeOpenSec),
-                identifier: openID
-            )
+            if !device.isOn && device.timeOpenHours > 0 && device.remainingTimeOpenSec > 5 {
+                self.scheduleSystemNotification(
+                    title: "🔥 \(device.name) 预约定时开机已启动",
+                    body: "预约的 \(device.timeOpenHours) 小时开机时间已到，电热毯已开始为您暖被。",
+                    delay: TimeInterval(device.remainingTimeOpenSec),
+                    identifier: openID
+                )
+            }
         }
     }
 
