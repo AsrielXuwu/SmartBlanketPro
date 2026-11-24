@@ -2,17 +2,14 @@ import SwiftUI
 
 /// 设备管理中心 (`DeviceListView`)
 /// 修复并增强：
-/// 1. 修复长按已配对设备时卡片内容消失且开关按钮变菱形的问题 (Requirement 6)：
-///    - 避免在带有 `UIContextMenuInteraction` 的 `List` 单元格内嵌 `_UIGlassEffect` 子按钮导致系统长按快照遮罩错位；
-///    - 显式配置 `.contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 18, style: .continuous))` 与完整长按预览卡片 `preview:`；
-/// 2. 修复删除设备时偶发闪退问题 (Requirement 6)：
-///    - 等待长按菜单/滑动动作收起动画释放单元格引用后再安全移除设备，配合全局安全 ID 绑定彻底杜绝越界闪退；
-/// 3. 严格应用新版挡位色彩与待机语义图标配色 (Requirement 3)。
+/// 1. 修复长按已配对设备时卡片尺寸瞬间缩小、边缘被截断及退出弹回的问题：移除冲突的 `contentShape(.contextMenuPreview)` 与固定窄宽度的自定义 `preview:`，让系统原生 `List` 单元格直接以完整行尺寸平滑提拉与回落；
+/// 2. 修复删除设备时偶发闪退问题：延迟等待长按/左滑收起后通过安全 ID 移除；
+/// 3. 支持嵌入 `MainTabView` 统一 `NavigationStack` 实现三页左右滑动无缝切换，顶栏操作按钮由 `MainTabView` 统一承载并带无缝过渡动画。
 public struct DeviceListView: View {
     @ObservedObject var bleManager: BlanketBLEManager
     var onSelectDeviceForControl: ((UUID) -> Void)?
+    @Binding var showingScannerSheet: Bool
 
-    @State private var showingScannerSheet = false
     @State private var editingDevice: BlanketDevice?
     @State private var editName: String = ""
     @State private var editRoom: String = ""
@@ -20,130 +17,102 @@ public struct DeviceListView: View {
 
     public init(
         bleManager: BlanketBLEManager,
+        showingScannerSheet: Binding<Bool> = .constant(false),
         onSelectDeviceForControl: ((UUID) -> Void)? = nil
     ) {
         self.bleManager = bleManager
+        self._showingScannerSheet = showingScannerSheet
         self.onSelectDeviceForControl = onSelectDeviceForControl
     }
 
     public var body: some View {
-        NavigationStack {
-            List {
-                // 1. 已绑定电热毯设备列表 Section
-                Section {
-                    ForEach(bleManager.devices) { device in
-                        let targetID = device.id
-                        deviceNativeRow(for: device)
-                            .contentShape(
-                                .contextMenuPreview,
-                                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            )
-                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                Button(role: .destructive) {
-                                    scheduleSafeRemoveDevice(deviceID: targetID)
-                                } label: {
-                                    Label("移除", systemImage: "trash")
-                                }
-
-                                Button {
-                                    beginEditing(device)
-                                } label: {
-                                    Label("设置", systemImage: "slider.horizontal.3")
-                                }
-                                .tint(.blue)
+        List {
+            // 1. 已绑定电热毯设备列表 Section
+            Section {
+                ForEach(bleManager.devices) { device in
+                    let targetID = device.id
+                    deviceNativeRow(for: device)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button(role: .destructive) {
+                                scheduleSafeRemoveDevice(deviceID: targetID)
+                            } label: {
+                                Label("移除", systemImage: "trash")
                             }
-                            .contextMenu {
-                                Button {
-                                    Task { @MainActor in
-                                        await bleManager.setPower(isOn: !device.isOn, for: targetID)
-                                    }
-                                } label: {
-                                    Label(device.isOn ? "关闭电热毯" : "开启电热毯", systemImage: "power")
-                                }
 
-                                Button {
-                                    bleManager.activeDeviceID = targetID
-                                    onSelectDeviceForControl?(targetID)
-                                } label: {
-                                    Label("设为当前主控并进入温控", systemImage: "thermometer.medium")
-                                }
-
-                                Button {
-                                    beginEditing(device)
-                                } label: {
-                                    Label("编辑名称与硬件 MAC", systemImage: "pencil")
-                                }
-
-                                Button {
-                                    Task { @MainActor in
-                                        await bleManager.queryStatus(for: targetID)
-                                    }
-                                } label: {
-                                    Label("同步硬件状态", systemImage: "arrow.clockwise")
-                                }
-
-                                Divider()
-
-                                Button(role: .destructive) {
-                                    scheduleSafeRemoveDevice(deviceID: targetID)
-                                } label: {
-                                    Label("移除设备", systemImage: "trash")
-                                }
-                            } preview: {
-                                deviceContextPreviewCard(for: device)
+                            Button {
+                                beginEditing(device)
+                            } label: {
+                                Label("设置", systemImage: "slider.horizontal.3")
                             }
-                    }
-                } header: {
-                    Text("已配对的智能电热毯 (\(bleManager.devices.count))")
-                } footer: {
-                    Text("点按设备可切换为当前主控电热毯；长按或左滑设备可修改房间名称、校准硬件 MAC 地址或移除设备。")
-                }
+                            .tint(.blue)
+                        }
+                        .contextMenu {
+                            Button {
+                                Task { @MainActor in
+                                    await bleManager.setPower(isOn: !device.isOn, for: targetID)
+                                }
+                            } label: {
+                                Label(device.isOn ? "关闭电热毯" : "开启电热毯", systemImage: "power")
+                            }
 
-                // 2. 快速扫描与添加入口 Section
-                Section("发现与添加") {
-                    Button {
-                        showingScannerSheet = true
-                    } label: {
-                        Label("通过蓝牙扫描发现周边电热毯", systemImage: "dot.radiowaves.left.and.right")
-                    }
-                }
-            }
-            .listStyle(.insetGrouped)
-            .navigationTitle("设备管理")
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        showingScannerSheet = true
-                    } label: {
-                        Label("添加设备", systemImage: "plus")
-                    }
-                }
+                            Button {
+                                bleManager.activeDeviceID = targetID
+                                onSelectDeviceForControl?(targetID)
+                            } label: {
+                                Label("设为当前主控并进入温控", systemImage: "thermometer.medium")
+                            }
 
-                ToolbarSpacer(.fixed)
+                            Button {
+                                beginEditing(device)
+                            } label: {
+                                Label("编辑名称与硬件 MAC", systemImage: "pencil")
+                            }
 
-                ToolbarItem(placement: .secondaryAction) {
-                    Button {
-                        let snapshotIDs = bleManager.devices.map(\.id)
-                        for id in snapshotIDs {
-                            Task { @MainActor in
-                                await bleManager.queryStatus(for: id)
+                            Button {
+                                Task { @MainActor in
+                                    await bleManager.queryStatus(for: targetID)
+                                }
+                            } label: {
+                                Label("同步硬件状态", systemImage: "arrow.clockwise")
+                            }
+
+                            Divider()
+
+                            Button(role: .destructive) {
+                                scheduleSafeRemoveDevice(deviceID: targetID)
+                            } label: {
+                                Label("移除设备", systemImage: "trash")
                             }
                         }
-                    } label: {
-                        Label("全部刷新", systemImage: "arrow.clockwise")
-                    }
+                }
+            } header: {
+                Text("已配对的智能电热毯 (\(bleManager.devices.count))")
+            } footer: {
+                Text("点按设备可切换为当前主控电热毯；长按或左滑设备可修改房间名称、校准硬件 MAC 地址或移除设备。")
+            }
+
+            // 2. 快速扫描与添加入口 Section
+            Section("发现与添加") {
+                Button {
+                    showingScannerSheet = true
+                } label: {
+                    Label("通过蓝牙扫描发现周边电热毯", systemImage: "dot.radiowaves.left.and.right")
                 }
             }
-            .sheet(isPresented: $showingScannerSheet) {
-                ScannerSheetView(bleManager: bleManager)
-                    .presentationDetents([.medium, .large])
-                    .presentationDragIndicator(.visible)
+
+            // 底部留白，避免内容被底部悬浮胶囊 Tab 栏遮挡
+            Section {
+                Color.clear
+                    .frame(height: 68)
             }
-            .sheet(item: $editingDevice) { device in
-                editDeviceSheet(for: device)
-                    .presentationDetents([.medium])
-                    .presentationDragIndicator(.visible)
-            }
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+        }
+        .listStyle(.insetGrouped)
+        .sheet(item: $editingDevice) { device in
+            editDeviceSheet(for: device)
+                .presentationDetents([.medium])
+                .presentationDragIndicator(.visible)
         }
     }
 
@@ -160,7 +129,7 @@ public struct DeviceListView: View {
         }
     }
 
-    // MARK: - 原生设备列表行（消除长按时 _UIGlassEffect 遮罩裁切与菱形畸变）
+    // MARK: - 原生设备列表行
     private func deviceNativeRow(for device: BlanketDevice) -> some View {
         let phase = bleManager.connectionPhase(for: device.id)
         let dominantGear = max(device.gearLeft, device.gearRight)
@@ -220,13 +189,12 @@ public struct DeviceListView: View {
                         }
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
-            Spacer(minLength: 8)
-
-            // 原生圆形电源开关按钮（使用标准 Circle 渲染，避免在 List cell 的 UIContextMenuInteraction 中产生菱形遮罩畸变）
+            // 原生圆形电源开关按钮
             Button {
                 Task { @MainActor in
                     await bleManager.setPower(isOn: !device.isOn, for: device.id)
@@ -247,77 +215,7 @@ public struct DeviceListView: View {
             .accessibilityLabel(device.isOn ? "关闭电热毯" : "开启电热毯")
         }
         .padding(.vertical, 4)
-    }
-
-    // MARK: - 长按 ContextMenu 完整预览卡片（彻底解决长按时内容消失问题）
-    private func deviceContextPreviewCard(for device: BlanketDevice) -> some View {
-        let phase = bleManager.connectionPhase(for: device.id)
-        let dominantGear = max(device.gearLeft, device.gearRight)
-        let activeGearColor = LiquidGlassTheme.gearColor(for: dominantGear, mode: device.mode)
-        let standbyIconColor = LiquidGlassTheme.iconColor(
-            for: .deviceListStandby,
-            isOn: device.isOn,
-            mode: device.mode,
-            gear: dominantGear
-        )
-
-        return VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                ZStack {
-                    Circle()
-                        .fill(device.isOn ? activeGearColor.opacity(0.18) : standbyIconColor.opacity(0.14))
-                        .frame(width: 44, height: 44)
-                    Image(systemName: device.isOn ? device.mode.symbolName : "bed.double.fill")
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(device.isOn ? activeGearColor : standbyIconColor)
-                }
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(device.name)
-                        .font(.headline)
-                    Text("\(device.roomName) · MAC: \(device.macAddress)")
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Text(device.isOn ? "加热中" : "待机")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(device.isOn ? activeGearColor : .secondary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(
-                        (device.isOn ? activeGearColor : Color.secondary).opacity(0.14),
-                        in: Capsule()
-                    )
-            }
-
-            Divider()
-
-            HStack {
-                Label("左区 \(device.gearLeft)挡 (\(device.temperatureLeft)°C)", systemImage: "lefthand.raised.fill")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(LiquidGlassTheme.gearColor(for: device.gearLeft, mode: device.mode))
-                Spacer()
-                Label("右区 \(device.gearRight)挡 (\(device.temperatureRight)°C)", systemImage: "righthand.raised.fill")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(LiquidGlassTheme.gearColor(for: device.gearRight, mode: device.mode))
-            }
-
-            HStack {
-                Label(phase.rawValue, systemImage: "dot.radiowaves.left.and.right")
-                    .font(.caption2)
-                    .foregroundStyle(phase == .connected ? .green : .secondary)
-                Spacer()
-                Text("累计运行 \(String(format: "%.1f", device.totalHistoricalHours())) 小时")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(18)
-        .frame(width: 320)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - 编辑设备信息 Sheet
