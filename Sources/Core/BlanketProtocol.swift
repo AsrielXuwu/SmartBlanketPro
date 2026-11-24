@@ -2,7 +2,7 @@ import Foundation
 import CommonCrypto
 
 /// 晶合物联 (JingHe IoT) 蓝牙电热毯核心通信协议与 DES-ECB 加解密引擎
-/// 完整复刻并增强自 Home Assistant `blanket_protocol.py` 实现
+/// 严格对照原版微信小程序源码 (`utils/des.js`, `utils/ble/helper.js`, `utils/ble/CRC.js`, `behaviors/bleBehaviors.js`, `subpkgs/blepanelA/pages/blanket/blanket.js`, `subpkgs/blepanelA/pages/blanketto/blanketto.js`) 完整对齐
 public enum BlanketProtocol {
 
     // MARK: - BLE GATT UUID Constants
@@ -18,7 +18,7 @@ public enum BlanketProtocol {
     public static let versionServiceUUID = "4A485100-4A48-1000-8000-00805F9B34FB"
     public static let versionCharacteristicUUID = "4A486101-4A48-1000-8000-00805F9B34FB"
 
-    // MARK: - TLV Property Headers
+    // MARK: - TLV Property Headers (严格对齐小程序 blanket.js / blanketto.js)
     public static let propPower      = "01010001" // 电源开关 (1 byte: 00 关, 01 开)
     public static let propTimeOpen   = "1f020004" // 预约开机定时 (4 bytes: 小时数 0~12, 0 为关闭)
     public static let propMode       = "52020004" // 工作模式 (4 bytes: 0 普通加热, 1 高温除螨)
@@ -28,15 +28,35 @@ public enum BlanketProtocol {
     public static let propRemOpen    = "9a020004" // 剩余预约开机秒数 (4 bytes: 只读秒数)
     public static let propRemClose   = "9b020004" // 剩余自动关机秒数 (4 bytes: 只读秒数)
 
-    /// 全状态查询指令（一次性请求全部 8 个属性：01, 1f, 52, 97, 98, 99, 9a, 9b）
+    /// 全状态 8 属性查询指令（对应小程序 `blanketto.js` 默认查询：`01, 1f, 52, 97, 98, 99, 9a, 9b`）
     public static let queryAllStatusCmd = "00040008011f529798999a9b"
-    /// 核心 5 属性查询指令（兼容旧固件：01, 52, 97, 98, 99）
+    /// 6 属性查询指令（对应小程序 `productId == "230714000008"`：`01, 1f, 52, 97, 98, 99`）
+    public static let querySixStatusCmd = "00040006011f52979899"
+    /// 核心 5 属性查询指令（对应小程序 `productId == "230713000003"` 及 HA `blanket_protocol.py`：`01, 52, 97, 98, 99`）
     public static let queryCoreStatusCmd = "000400050152979899"
 
     public static let knownPrefixes: [String] = [
         propPower, propMode, propGearLeft, propGearRight,
         propTimeClose, propTimeOpen, propRemOpen, propRemClose
     ]
+
+    /// 防重放随机盐历史队列（严格复刻小程序 `writeRandom: ["0000"]`，保留最近 20 个随机数，禁止出现 `"0000"` 或重复值）
+    private static var writeRandomHistory: [String] = ["0000"]
+    private static let randomLock = NSLock()
+
+    /// 根据小程序 `blanketto.js` 的 `productId` 返回匹配的查询指令
+    public static func queryCommand(forProductId pid: String?) -> String {
+        guard let pid = pid, !pid.isEmpty else {
+            return queryCoreStatusCmd
+        }
+        if pid == "230713000003" {
+            return queryCoreStatusCmd
+        } else if pid == "230714000008" {
+            return querySixStatusCmd
+        } else {
+            return queryAllStatusCmd
+        }
+    }
 
     // MARK: - Gear <-> Temperature Calibration (18°C ~ 45°C)
     public static let gearToTempMap: [Int: Int] = [
@@ -65,6 +85,102 @@ public enum BlanketProtocol {
         return min(9, max(1, mapped))
     }
 
+    // MARK: - WeChat MiniProgram CRC16 (`utils/ble/CRC.js`)
+    /// 严格复刻微信小程序 `utils/ble/CRC.js` 的 CRC16 算法（多项式 `33800` = `0x8408`，初值 `0`）
+    public static func crc16(_ bytes: ArraySlice<UInt8>) -> UInt16 {
+        var crc: UInt16 = 0
+        for b in bytes {
+            crc ^= UInt16(b)
+            for _ in 0..<8 {
+                if (crc & 1) != 0 {
+                    crc = (crc >> 1) ^ 33800
+                } else {
+                    crc = crc >> 1
+                }
+            }
+        }
+        return crc & 0xFFFF
+    }
+
+    /// 严格复刻微信小程序 `checkCrc16(e)`：校验末尾 2 字节大端 CRC16 是否与前 N-2 字节匹配
+    public static func checkCrc16(_ data: Data) -> Bool {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 3 else { return false }
+        let calc = crc16(bytes[0..<(bytes.count - 2)])
+        let expected = (UInt16(bytes[bytes.count - 2]) << 8) | UInt16(bytes[bytes.count - 1])
+        return calc == expected
+    }
+
+    // MARK: - WeChat MiniProgram Advertisement Parsing (`utils/ble/helper.js` -> `getPidAndMac`)
+    public struct ParsedAdvertisementInfo: Sendable {
+        /// 6 字节产品 ID 十六进制字符串（如 `"230713000003"`）
+        public let productId: String
+        /// 广播包原始 6 字节 `deviceManufactCode` 小写十六进制（如 `"60f864d6b28e"`，小程序直接用 `rawMacHex + "5700"` 作为 DES 密钥）
+        public let rawMacHex: String
+        /// 人类可读标准冒号分隔 MAC 地址（如 `"8E:B2:D6:64:F8:60"`）
+        public let displayMAC: String
+        /// 100% 匹配微信小程序 `this.data.productInfo.deviceManufactCode + "5700"` 的 8 字节 DES 密钥
+        public let exactSecretKey: Data
+    }
+
+    /// 严格按照微信小程序 `filterDeviceList` + `getPidAndMac` 从 `0x5700` Service Data (14 字节) 解析 `pid`、`mac` 与 8 字节 DES 密钥
+    public static func parseServiceData5700(_ serviceData: Data) -> ParsedAdvertisementInfo? {
+        guard serviceData.count >= 12 else { return nil }
+        // 若长度为完整 14 字节，执行与小程序完全一致的 checkCrc16 校验，杜绝脏数据
+        if serviceData.count >= 14 {
+            let packet14 = serviceData.prefix(14)
+            guard checkCrc16(packet14) else { return nil }
+        }
+
+        let pidSlice = serviceData.subdata(in: 0..<6)
+        let macSlice = serviceData.subdata(in: 6..<12)
+
+        let pidHex = pidSlice.hexEncodedString().lowercased()
+        let rawMacHex = macSlice.hexEncodedString().lowercased()
+
+        // 小程序密钥公式：secretKey = deviceManufactCode + "5700"，即 macSlice 原始 6 字节直接拼接 [0x57, 0x00]
+        var secretKey = Data(macSlice)
+        secretKey.append(contentsOf: [0x57, 0x00])
+
+        // 广播中的 6 字节为小端序，反转为标准大端显示格式（如 60:F8:64:D6:B2:8E -> 8E:B2:D6:64:F8:60）
+        let reversedBytes = Data(macSlice.reversed())
+        let displayMAC = reversedBytes.map { String(format: "%02X", $0) }.joined(separator: ":")
+
+        return ParsedAdvertisementInfo(
+            productId: pidHex,
+            rawMacHex: rawMacHex,
+            displayMAC: displayMAC,
+            exactSecretKey: secretKey
+        )
+    }
+
+    /// 严格按照微信小程序 `filterDeviceList` 从 `0x5703` / `0x5678` / `0x5679` 的 `advertisData` (ManufacturerData) 解析
+    /// 注意：必须通过 `checkCrc16(data.dropFirst())` 校验才允许提取，绝不从普通厂商数据中盲目截取字节！
+    public static func parseVerifiedManufacturerData(_ mfgData: Data) -> ParsedAdvertisementInfo? {
+        guard mfgData.count >= 15 else { return nil }
+        let payloadWithCrc = mfgData.subdata(in: 1..<15)
+        guard checkCrc16(payloadWithCrc) else { return nil }
+
+        let pidSlice = mfgData.subdata(in: 1..<7)
+        let macSlice = mfgData.subdata(in: 7..<13)
+
+        let pidHex = pidSlice.hexEncodedString().lowercased()
+        let rawMacHex = macSlice.hexEncodedString().lowercased()
+
+        var secretKey = Data(macSlice)
+        secretKey.append(contentsOf: [0x57, 0x00])
+
+        let reversedBytes = Data(macSlice.reversed())
+        let displayMAC = reversedBytes.map { String(format: "%02X", $0) }.joined(separator: ":")
+
+        return ParsedAdvertisementInfo(
+            productId: pidHex,
+            rawMacHex: rawMacHex,
+            displayMAC: displayMAC,
+            exactSecretKey: secretKey
+        )
+    }
+
     // MARK: - MAC Address Normalization & Extraction
     /// 规范化 MAC 地址为 `XX:XX:XX:XX:XX:XX` 大写格式
     public static func normalizeMAC(_ raw: String) -> String? {
@@ -87,18 +203,10 @@ public enum BlanketProtocol {
         return parts.joined(separator: ":")
     }
 
-    /// 从 BLE 广播的 0x5700 Service Data (14 字节) 或 Manufacturer Data 中自动提取 6 字节硬件 MAC 地址
-    /// 广播 Service Data 结构：字节 0~5 为 Product ID，字节 6~11 为 MAC 地址，字节 12~13 为 CRC16
+    /// 从 BLE 广播的 0x5700 Service Data (14 字节) 中安全提取 6 字节硬件 MAC 地址
     public static func extractMACFromAdvertisement(serviceData: Data) -> String? {
-        if serviceData.count >= 12 {
-            let macSlice = serviceData.subdata(in: 6..<12)
-            // 广播包内通常为小端字节序或正序，我们将其格式化为标准 MAC（在 getSecretKey 中同时支持正反双向验证）
-            let reversedBytes = Data(macSlice.reversed())
-            let hex = reversedBytes.map { String(format: "%02X", $0) }.joined(separator: ":")
-            return hex
-        } else if serviceData.count == 6 {
-            let hex = serviceData.map { String(format: "%02X", $0) }.joined(separator: ":")
-            return hex
+        if let parsed = parseServiceData5700(serviceData) {
+            return parsed.displayMAC
         }
         return nil
     }
@@ -106,12 +214,13 @@ public enum BlanketProtocol {
     // MARK: - Dynamic DES Key Derivation
     /// 从设备 MAC 地址派生 8 字节 DES 密钥
     /// - Parameters:
-    ///   - macAddress: 设备硬件 MAC（如 `8E:B2:D6:64:F8:60`）
-    ///   - reverseMac: 是否按小端序翻转 6 字节 MAC（默认 `true`，即 `60f864d6b28e5700`）
+    ///   - macAddress: 设备硬件 MAC（如 `8E:B2:D6:64:F8:60` 或广播原始 `60:F8:64:D6:B2:8E`）
+    ///   - reverseMac: 是否按小端序翻转 6 字节 MAC（默认 `true`，将 `8E:B2:D6:64:F8:60` 转换为 `60f864d6b28e5700`）
     public static func getSecretKey(macAddress: String, reverseMac: Bool = true) -> Data? {
         let clean = macAddress
             .replacingOccurrences(of: ":", with: "")
             .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: " ", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
 
@@ -126,10 +235,31 @@ public enum BlanketProtocol {
         return keyData
     }
 
-    // MARK: - DES-ECB Encryption & Decryption (CommonCrypto)
-    /// 封装控制指令：追加 2 字节随机盐 -> 8 字符 Hex 对齐 -> 8 字节 ZeroPadding -> DES-ECB 加密
+    /// 生成不重复的 4 位十六进制防重放随机盐（严格复刻小程序 `getSendData` 的 `writeRandom` 队列逻辑）
+    private static func nextRandomSaltHex() -> String {
+        randomLock.lock()
+        defer { randomLock.unlock() }
+
+        var candidate = "ffff"
+        for _ in 0..<100 {
+            let randVal = UInt16.random(in: 1...0xFFFE)
+            let hex = String(format: "%04x", randVal)
+            if !writeRandomHistory.contains(hex) {
+                candidate = hex
+                break
+            }
+        }
+        writeRandomHistory.append(candidate)
+        if writeRandomHistory.count > 20 {
+            writeRandomHistory.removeFirst()
+        }
+        return candidate
+    }
+
+    // MARK: - DES-ECB Encryption & Decryption (CommonCrypto, 严格复刻 utils/des.js)
+    /// 封装控制指令：追加 2 字节不重复随机盐 -> 8 字符 Hex 对齐 -> 8 字节 ZeroPadding -> DES-ECB 加密
     public static func encryptPayload(cmdHex: String, secretKey: Data) -> Data? {
-        let randomSalt = String(format: "%04x", UInt16.random(in: 0...UInt16.max))
+        let randomSalt = nextRandomSaltHex()
         var payloadHex = cmdHex.lowercased() + randomSalt
 
         let remHex = payloadHex.count % 8
@@ -141,7 +271,7 @@ public enum BlanketProtocol {
             return nil
         }
 
-        // Zero-pad to 8-byte DES block boundary
+        // Zero-pad to 8-byte DES block boundary (CryptoJS.pad.ZeroPadding)
         let remBytes = rawBytes.count % kCCBlockSizeDES
         if remBytes != 0 {
             rawBytes.append(Data(repeating: 0x00, count: kCCBlockSizeDES - remBytes))
@@ -150,12 +280,12 @@ public enum BlanketProtocol {
         return performDES(operation: CCOperation(kCCEncrypt), input: rawBytes, key: secretKey)
     }
 
-    /// 解密电热毯上报的 Notify 密文，自动校验 TLV 前缀并在需要时回退至备用正序密钥 `altKey`
+    /// 解密电热毯上报的 Notify 密文，自动校验 TLV 头部并在需要时回退至备用密钥 `altKey`
     public static func decryptPayload(cipherBytes: Data, secretKey: Data, altKey: Data? = nil) -> String? {
         guard let decrypted = performDES(operation: CCOperation(kCCDecrypt), input: cipherBytes, key: secretKey) else {
             return nil
         }
-        let decHex = decrypted.hexEncodedString()
+        let decHex = decrypted.hexEncodedString().lowercased()
 
         if knownPrefixes.contains(where: { decHex.hasPrefix($0) }) {
             return decHex
@@ -163,7 +293,7 @@ public enum BlanketProtocol {
 
         if let altKey = altKey,
            let altDecrypted = performDES(operation: CCOperation(kCCDecrypt), input: cipherBytes, key: altKey) {
-            let altHex = altDecrypted.hexEncodedString()
+            let altHex = altDecrypted.hexEncodedString().lowercased()
             if knownPrefixes.contains(where: { altHex.hasPrefix($0) }) {
                 return altHex
             }
@@ -172,12 +302,11 @@ public enum BlanketProtocol {
         return decHex
     }
 
-    /// 原生 CommonCrypto DES-ECB 运算（无外部库依赖，编译速度极快）
+    /// 原生 CommonCrypto DES-ECB 运算
     private static func performDES(operation: CCOperation, input: Data, key: Data) -> Data? {
         guard key.count == kCCKeySizeDES, !input.isEmpty else { return nil }
 
-        // 确保输入为 8 字节整数倍
-        var paddedInput = input
+        var paddedInput = Data(input)
         let rem = paddedInput.count % kCCBlockSizeDES
         if rem != 0 {
             paddedInput.append(Data(repeating: 0x00, count: kCCBlockSizeDES - rem))
@@ -187,38 +316,44 @@ public enum BlanketProtocol {
         var outBytes = [UInt8](repeating: 0, count: outLength)
         var numBytesProcessed: size_t = 0
 
-        let status = paddedInput.withUnsafeBytes { inputBytes in
-            key.withUnsafeBytes { keyBytes in
-                CCCrypt(
-                    operation,
-                    CCAlgorithm(kCCAlgorithmDES),
-                    CCOptions(kCCOptionECBMode), // ZeroPadding 已由业务层精确处理
-                    keyBytes.baseAddress,
-                    kCCKeySizeDES,
-                    nil,
-                    inputBytes.baseAddress,
-                    paddedInput.count,
-                    &outBytes,
-                    outLength,
-                    &numBytesProcessed
-                )
-            }
-        }
+        let inputArray = [UInt8](paddedInput)
+        let keyArray = [UInt8](key)
+
+        let status = CCCrypt(
+            operation,
+            CCAlgorithm(kCCAlgorithmDES),
+            CCOptions(kCCOptionECBMode),
+            keyArray,
+            kCCKeySizeDES,
+            nil,
+            inputArray,
+            inputArray.count,
+            &outBytes,
+            outLength,
+            &numBytesProcessed
+        )
 
         guard status == kCCSuccess else { return nil }
         return Data(outBytes.prefix(numBytesProcessed))
     }
 
-    // MARK: - TLV Stream Parser
+    // MARK: - TLV Stream Parser (严格复刻小程序 blanket.js / blanketto.js 的 handleBleData & setBleData)
     /// 解析解密后的 TLV 十六进制状态流
+    /// 小程序逻辑：
+    /// `for (; e.length >= 10;) { var t = 2 * parseInt(e.slice(7, 8)) + 8; this.setBleData(e.slice(0, t)), e = e.slice(t) }`
     public static func parseTLVData(hexString: String) -> BlanketTLVUpdate {
         var update = BlanketTLVUpdate()
         let hex = hexString.lowercased()
         let chars = Array(hex)
         var i = 0
 
-        while i + 8 <= chars.count {
-            let propID = String(chars[i..<(i + 2)])
+        while i + 10 <= chars.count {
+            let header = String(chars[i..<(i + 8)])
+            // 严格校验 8 字符 TLV 头部是否属于已知属性标识（防止将末尾 2 字节随机盐误解析为属性）
+            guard knownPrefixes.contains(header) else {
+                break
+            }
+
             let lenHex = String(chars[(i + 4)..<(i + 8)])
             guard let valLen = Int(lenHex, radix: 16), valLen > 0, valLen <= 16 else {
                 break
@@ -235,37 +370,37 @@ public enum BlanketProtocol {
                 break
             }
 
-            switch propID {
-            case "01":
+            switch header {
+            case propPower:
                 update.isOn = (val == 1)
                 update.hasValidProperty = true
-            case "52":
+            case propMode:
                 update.mode = (val == 1) ? .miteRemoval : .normal
                 update.hasValidProperty = true
-            case "97":
-                if (1...9).contains(val) {
-                    update.gearLeft = val
+            case propGearLeft:
+                if val >= 1 {
+                    update.gearLeft = min(9, max(1, val))
                 }
                 update.hasValidProperty = true
-            case "98":
-                if (1...9).contains(val) {
-                    update.gearRight = val
+            case propGearRight:
+                if val >= 1 {
+                    update.gearRight = min(9, max(1, val))
                 }
                 update.hasValidProperty = true
-            case "99":
+            case propTimeClose:
                 if (0...24).contains(val) {
                     update.timeCloseHours = val
                 }
                 update.hasValidProperty = true
-            case "1f":
+            case propTimeOpen:
                 if (0...24).contains(val) {
                     update.timeOpenHours = val
                 }
                 update.hasValidProperty = true
-            case "9a":
+            case propRemOpen:
                 update.remainingTimeOpenSec = max(0, val)
                 update.hasValidProperty = true
-            case "9b":
+            case propRemClose:
                 update.remainingTimeCloseSec = max(0, val)
                 update.hasValidProperty = true
             default:
@@ -278,7 +413,7 @@ public enum BlanketProtocol {
         return update
     }
 
-    // MARK: - Command Generators
+    // MARK: - Command Generators (严格对齐小程序 blanket.js / blanketto.js)
     public static func cmdPower(isOn: Bool) -> String {
         String(format: "%@%02x", propPower, isOn ? 1 : 0)
     }

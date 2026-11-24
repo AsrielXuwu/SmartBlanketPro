@@ -4,17 +4,17 @@ import Combine
 import SwiftUI
 
 /// 高速 CoreBluetooth 点对点缓存直连与双向状态同步引擎
-/// 严格对标 `blanket_protocol.py` 与 `blanket_client.py` 修复控制无响应与物理按键不同步问题：
-/// 1. **修正状态查询指令**：严格使用 `blanket_protocol.py` 中的 `QUERY_STATUS_CMD = "000400050152979899"`（5核心属性查询），确保硬件固件立即回复 5 个 TLV Notify 状态包；
-/// 2. **双向 DES 密钥自适应锁定 (`verifiedWorkingKey`)**：
-///    - 消除 iOS 广播 `0x5700` Service Data 提取 MAC 与手动 MAC 之间的大小端二次翻转问题；
-///    - 在收到硬件 Notify 回包时，自动用小端密钥 (`reverseMac: true`) 与正序密钥 (`reverseMac: false`) 双向匹配 TLV 前缀 (`01010001`/`52020004`/`97020004` 等)，一旦命中立即永久锁定该设备的真实工作密钥；
-///    - 在尚未锁定密钥前下发指令时，自动双密钥兼容保底发送，确保 100% 破译并响应；
-/// 3. **GATT 写入类型精确匹配 (`withResponse` + `withoutResponse` 自动回退)**：
-///    - 严格复刻 `blanket_client.py` 的 `write_gatt_char(..., response=True)` 并在失败或特征值仅支持 `writeWithoutResponse` 时自动使用 `.withoutResponse`；
-/// 4. **前台实时监听物理按键 + 切后台自动断连**：
-///    - App 处于前台时保持 BLE 连接与 `4A486201` Notify 订阅，电热毯实体按钮调挡或开关时 50ms 内实时更新 App 界面；
-///    - App 切入后台时自动断开蓝牙释放连接，并在重回前台时 0.15s 命中 `retrievePeripherals` 缓存极速重连同步。
+/// 严格对照原版微信小程序源码 (`behaviors/bleBehaviors.js`, `utils/ble/helper.js`, `utils/ble/CRC.js`, `utils/des.js`, `subpkgs/blepanelA/pages/blanket/blanket.js`, `subpkgs/blepanelA/pages/blanketto/blanketto.js`) 修复控制与状态同步：
+/// 1. **100% 复刻小程序 0x5700 广播包 CRC16 校验与密钥提取 (`parseServiceData5700`)**：
+///    - 严格对 `0x5700` Service Data (14 字节) 执行 `checkCrc16` 校验（多项式 `0x8408 = 33800`），提取 `pid` (字节 0~5) 与原始 6 字节 `deviceManufactCode` (字节 6~11)；
+///    - 直接按小程序公式 `secretKey = deviceManufactCode + "5700"` 锁定 8 字节 DES 密钥，彻底杜绝从非 `0x5700` 的 `ManufacturerData` 误提取乱码字节覆盖 MAC 地址；
+///    - 升级持久化存储键至 `v3`，自动清理旧版本可能被 `ManufacturerData` 污染的缓存 MAC；
+/// 2. **严格遵循小程序 `notifyReadWrite` 时序**：
+///    - 发现 `4A486201` 特征值后先调用 `setNotifyValue(true)`，必须等待 `didUpdateNotificationStateFor` (CCCD `0x2902` 订阅生效) 完成后才标记 `.connected`、唤醒等待队列并下发状态查询指令，杜绝 CCCD 写入与特征值写入并发冲突；
+/// 3. **移除 160ms 错误密钥双发干扰，精准单通道加密通信**：
+///    - 移除在 160ms 后补发反向密钥密文的逻辑，避免向杰理 MCU 注入无法解析的乱码块导致指令被丢弃；
+/// 4. **前台实时监听物理按键 + 切入后台自动断连**：
+///    - 前台保持 BLE Notify 订阅，电热毯实体按钮开关机或调挡时实时解密 TLV 状态流并更新 UI；切入后台时自动断开蓝牙释放连接。
 public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sendable {
     public static let shared = BlanketBLEManager()
 
@@ -35,30 +35,42 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         didSet { UserDefaults.standard.set(disconnectWhenEnteringBackground, forKey: "com.smartblanketpro.bg_disconnect") }
     }
 
-    // MARK: - Point-to-Point Cache (外设对象缓存 + 特征值缓存 + DES 双向密钥缓存 + 已验证密钥锁定)
+    // MARK: - Point-to-Point Cache (外设对象缓存 + 特征值缓存 + 广播精确密钥缓存 + 已验证密钥锁定)
     private var centralManager: CBCentralManager?
     private var isBluetoothActivated: Bool = false
     private var activePeripherals: [UUID: CBPeripheral] = [:]
-    private var discoveredPeripheralObjects: [UUID: CBPeripheral] = [:] // CBPeripheral.identifier -> CBPeripheral 强引用缓存
+    private var discoveredPeripheralObjects: [UUID: CBPeripheral] = [:] // CBPeripheral.identifier -> CBPeripheral
     private var controlCharacteristics: [UUID: CBCharacteristic] = [:]
     private var cachedSecretKeys: [String: (primary: Data, alt: Data)] = [:]
-    private var verifiedWorkingKeys: [UUID: Data] = [:] // 一旦硬件 Notify 验证通过，锁定该设备 100% 正确的 8 字节 DES 密钥
+    /// 从经过 CRC16 校验的 0x5700 广播包直接提取的 8 字节精确密钥 (deviceManufactCode + "5700")
+    private var peripheralBroadcastKeys: [UUID: Data] = [:] // CBPeripheral.identifier -> 8-byte DES Key
+    private var peripheralProductIDs: [UUID: String] = [:]  // CBPeripheral.identifier -> 12-char Product ID
+    private var peripheralDisplayMACs: [UUID: String] = [:] // CBPeripheral.identifier -> XX:XX:XX:XX:XX:XX
+    /// 一旦硬件 Notify 验证通过或广播 CRC16 验证通过，锁定该设备 100% 正确的 8 字节 DES 密钥
+    private var verifiedWorkingKeys: [UUID: Data] = [:]     // BlanketDevice.id -> 8-byte DES Key
+    private var deviceProductIDs: [UUID: String] = [:]      // BlanketDevice.id -> 12-char Product ID
     private var lastWrittenCipherPayloads: [UUID: Data] = [:]
-    private var peripheralToDeviceMap: [UUID: UUID] = [:] // CBPeripheral.identifier -> BlanketDevice.id
+    private var preferWriteWithoutResponse: Set<UUID> = []
+    private var hasConfirmedWriteResponse: Set<UUID> = []
+    private var peripheralToDeviceMap: [UUID: UUID] = [:]   // CBPeripheral.identifier -> BlanketDevice.id
 
     // MARK: - Pipeline & Lifecycle Tracking
     private var commandWriteStartTimes: [UUID: Date] = [:]
     private var pendingCommandsAfterConnect: [UUID: [String]] = [:]
     private var connectionContinuations: [UUID: [CheckedContinuation<Bool, Never>]] = [:]
+    private var notifyReadyFallbackTasks: [UUID: Task<Void, Never>] = [:]
+    private var pendingScanConnectTasks: [UUID: Task<Void, Never>] = [:]
     private var debounceTasks: [String: Task<Void, Never>] = [:]
     private var delayedQueryTasks: [UUID: Task<Void, Never>] = [:]
     private var isPoweringOnRestoringMemory: Set<UUID> = []
+    private var hasCompletedNotifyHandshake: Set<UUID> = []
     private var lastNotifiedStates: [UUID: (isOn: Bool, gearLeft: Int, gearRight: Int, mode: BlanketHeatingMode, timeClose: Int)] = [:]
     private var isAppInBackground: Bool = false
     private var runtimeTicker: AnyCancellable?
     private var pollCounter: Int = 0
 
-    public static let storageKey = "com.smartblanketpro.saved_devices.v1"
+    /// 升级存储 Key 至 v3，确保旧版被 ManufacturerData 覆盖的错误 MAC 缓存被彻底清除并重置为正确配置
+    public static let storageKey = "com.smartblanketpro.saved_devices.v3"
 
     private override init() {
         super.init()
@@ -88,6 +100,31 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         return pair
     }
 
+    /// 获取某个设备当前最权威的 8 字节 DES 密钥（优先顺序：已验证/广播 CRC16 精确密钥 -> MAC 派生小端密钥 -> 默认密钥）
+    private func resolveActiveSecretKey(for deviceID: UUID) -> (active: Data, alt: Data)? {
+        guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return nil }
+        let mac = devices[idx].macAddress
+        let pair = getCachedKeys(for: mac)
+
+        if let verified = verifiedWorkingKeys[deviceID] {
+            return (active: verified, alt: pair?.alt ?? verified)
+        }
+        if let p = activePeripherals[deviceID], let bKey = peripheralBroadcastKeys[p.identifier] {
+            verifiedWorkingKeys[deviceID] = bKey
+            return (active: bKey, alt: pair?.alt ?? bKey)
+        }
+        if let uuidStr = devices[idx].peripheralUUIDString,
+           let pUUID = UUID(uuidString: uuidStr),
+           let bKey = peripheralBroadcastKeys[pUUID] {
+            verifiedWorkingKeys[deviceID] = bKey
+            return (active: bKey, alt: pair?.alt ?? bKey)
+        }
+        if let pair = pair {
+            return (active: pair.primary, alt: pair.alt)
+        }
+        return nil
+    }
+
     /// 在主视图加载完成后安全激活 CoreBluetooth
     public func activateBluetoothIfNeeded() {
         if !Thread.isMainThread {
@@ -110,10 +147,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             activateBluetoothIfNeeded()
             if let activeID = activeDeviceID {
                 Task { @MainActor in
-                    let ok = await self.ensureConnected(deviceID: activeID)
-                    if ok {
-                        await self.queryStatus(for: activeID)
-                    }
+                    await self.ensureConnected(deviceID: activeID)
                 }
             }
 
@@ -211,26 +245,34 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         manualMAC: String
     ) {
         activateBluetoothIfNeeded()
-        let normalizedMAC = BlanketProtocol.normalizeMAC(manualMAC)
-            ?? discovered.extractedMAC
+        // 优先采用从 0x5700 Service Data CRC16 校验提取出的真实硬件 MAC，避免被手填输入框的默认占位符覆盖
+        let normalizedMAC = discovered.extractedMAC
+            ?? peripheralDisplayMACs[discovered.id]
+            ?? BlanketProtocol.normalizeMAC(manualMAC)
             ?? "8E:B2:D6:64:F8:60"
         _ = getCachedKeys(for: normalizedMAC)
 
-        // 若当前仅有默认预置且未绑定外设 UUID 的设备，直接原地更新绑定，避免产生重复设备导致控制错位
         if let idx = devices.firstIndex(where: {
             $0.peripheralUUIDString == discovered.id.uuidString ||
             $0.macAddress.caseInsensitiveCompare(normalizedMAC) == .orderedSame ||
             (devices.count == 1 && $0.peripheralUUIDString == nil)
         }) {
+            let targetID = devices[idx].id
             devices[idx].peripheralUUIDString = discovered.id.uuidString
             devices[idx].macAddress = normalizedMAC
             devices[idx].name = customName.isEmpty ? discovered.name : customName
             devices[idx].roomName = roomName.isEmpty ? "卧室" : roomName
             devices[idx].advertisedName = discovered.name
             devices[idx].lastRSSI = discovered.rssi
-            verifiedWorkingKeys.removeValue(forKey: devices[idx].id)
-            activeDeviceID = devices[idx].id
-            let targetID = devices[idx].id
+            if let exactKey = peripheralBroadcastKeys[discovered.id] {
+                verifiedWorkingKeys[targetID] = exactKey
+            } else {
+                verifiedWorkingKeys.removeValue(forKey: targetID)
+            }
+            if let pid = peripheralProductIDs[discovered.id] {
+                deviceProductIDs[targetID] = pid
+            }
+            activeDeviceID = targetID
             Task { @MainActor in
                 await self.ensureConnected(deviceID: targetID)
             }
@@ -243,9 +285,15 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                 advertisedName: discovered.name,
                 lastRSSI: discovered.rssi
             )
-            devices.append(newDevice)
-            activeDeviceID = newDevice.id
             let targetID = newDevice.id
+            if let exactKey = peripheralBroadcastKeys[discovered.id] {
+                verifiedWorkingKeys[targetID] = exactKey
+            }
+            if let pid = peripheralProductIDs[discovered.id] {
+                deviceProductIDs[targetID] = pid
+            }
+            devices.append(newDevice)
+            activeDeviceID = targetID
             Task { @MainActor in
                 await self.ensureConnected(deviceID: targetID)
             }
@@ -299,7 +347,6 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
     }
 
     public func stopScanning() {
-        // 如果当前仍有设备正在等待扫描连接，不中断底层扫描
         let hasConnectingWaitingForScan = devices.contains {
             connectionPhases[$0.id] == .connecting && activePeripherals[$0.id] == nil
         }
@@ -308,18 +355,19 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         isScanning = false
     }
 
-    // MARK: - Point-to-Point Cached Direct Connection Engine
+    // MARK: - Point-to-Point Cached Direct Connection Engine (对标小程序 startConnectDevice)
     @discardableResult
     @MainActor
-    public func ensureConnected(deviceID: UUID, timeout: TimeInterval = 7.0) async -> Bool {
+    public func ensureConnected(deviceID: UUID, timeout: TimeInterval = 7.5) async -> Bool {
         activateBluetoothIfNeeded()
         guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return false }
         let device = devices[idx]
 
-        // 1. 当前已连接且特征值就绪 -> 0ms 直接命中返回
+        // 1. 当前已连接且特征值与 Notify 订阅均已就绪 -> 0ms 直接命中返回
         if let peripheral = activePeripherals[deviceID],
            peripheral.state == .connected,
-           controlCharacteristics[deviceID] != nil {
+           controlCharacteristics[deviceID] != nil,
+           hasCompletedNotifyHandshake.contains(deviceID) {
             connectionPhases[deviceID] = .connected
             return true
         }
@@ -331,31 +379,35 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
 
         connectionPhases[deviceID] = .connecting
 
-        // 2. 优先从内存外设缓存、扫描缓存或 CoreBluetooth 系统已知设备缓存池中零扫描取回 CBPeripheral
+        // 2. 如果当前设备已经通过 0x5700 广播包 CRC16 或硬件 Notify 锁定了 verifiedWorkingKeys，
+        //    则可直接通过 retrievePeripherals 零扫描极速复连；
+        //    如果尚未锁定广播密钥（例如首次启动），则启动扫描以捕获 0x5700 Service Data 中的精确密钥与 PID（严格对齐小程序 startConnectDevice）
         var targetPeripheral: CBPeripheral? = activePeripherals[deviceID]
 
         if targetPeripheral == nil,
            let uuidStr = device.peripheralUUIDString,
-           let pUUID = UUID(uuidString: uuidStr) {
+           let pUUID = UUID(uuidString: uuidStr),
+           (verifiedWorkingKeys[deviceID] != nil || peripheralBroadcastKeys[pUUID] != nil) {
             targetPeripheral = discoveredPeripheralObjects[pUUID]
                 ?? central.retrievePeripherals(withIdentifiers: [pUUID]).first
         }
 
-        if targetPeripheral == nil {
-            let serviceUUID = CBUUID(string: BlanketProtocol.controlServiceUUID)
-            targetPeripheral = central.retrieveConnectedPeripherals(withServices: [serviceUUID]).first
-        }
-
-        // 如果扫描池中已经发现了唯一的晶合电热毯，直接自动绑定并点对点连接
         if targetPeripheral == nil,
-           let discoveredMatch = discoveredPeripherals.first(where: { $0.isJingHeBlanket }),
+           let discoveredMatch = discoveredPeripherals.first(where: { $0.isJingHeBlanket && $0.extractedMAC != nil }),
            let cachedObj = discoveredPeripheralObjects[discoveredMatch.id] {
             targetPeripheral = cachedObj
         }
 
         if let peripheral = targetPeripheral {
+            if let bKey = peripheralBroadcastKeys[peripheral.identifier] {
+                verifiedWorkingKeys[deviceID] = bKey
+            }
+            if let pid = peripheralProductIDs[peripheral.identifier] {
+                deviceProductIDs[deviceID] = pid
+            }
             bindAndConnect(peripheral: peripheral, to: deviceID)
         } else {
+            // 启动扫描以获取 0x5700 广播包中的 CRC16 校验 PID 与 MAC
             startScanning()
         }
 
@@ -380,13 +432,31 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
     }
 
     private func bindAndConnect(peripheral: CBPeripheral, to deviceID: UUID) {
+        pendingScanConnectTasks[deviceID]?.cancel()
+        pendingScanConnectTasks.removeValue(forKey: deviceID)
+
         activePeripherals[deviceID] = peripheral
         discoveredPeripheralObjects[peripheral.identifier] = peripheral
         peripheralToDeviceMap[peripheral.identifier] = deviceID
-        if let idx = devices.firstIndex(where: { $0.id == deviceID }),
-           devices[idx].peripheralUUIDString != peripheral.identifier.uuidString {
-            devices[idx].peripheralUUIDString = peripheral.identifier.uuidString
+
+        if let bKey = peripheralBroadcastKeys[peripheral.identifier] {
+            verifiedWorkingKeys[deviceID] = bKey
         }
+        if let pid = peripheralProductIDs[peripheral.identifier] {
+            deviceProductIDs[deviceID] = pid
+        }
+
+        if let idx = devices.firstIndex(where: { $0.id == deviceID }) {
+            if devices[idx].peripheralUUIDString != peripheral.identifier.uuidString {
+                devices[idx].peripheralUUIDString = peripheral.identifier.uuidString
+            }
+            if let cleanMAC = peripheralDisplayMACs[peripheral.identifier],
+               devices[idx].macAddress != cleanMAC {
+                devices[idx].macAddress = cleanMAC
+                _ = getCachedKeys(for: cleanMAC)
+            }
+        }
+
         peripheral.delegate = self
         if peripheral.state == .connected {
             peripheral.discoverServices(nil)
@@ -399,6 +469,9 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
 
     public func disconnect(deviceID: UUID) {
         delayedQueryTasks[deviceID]?.cancel()
+        notifyReadyFallbackTasks[deviceID]?.cancel()
+        pendingScanConnectTasks[deviceID]?.cancel()
+        hasCompletedNotifyHandshake.remove(deviceID)
         if let peripheral = activePeripherals[deviceID], peripheral.state != .disconnected {
             centralManager?.cancelPeripheralConnection(peripheral)
         }
@@ -406,47 +479,25 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         connectionPhases[deviceID] = .disconnected
     }
 
-    // MARK: - High-Speed Point-to-Point Command Pipeline (严格对齐 blanket_client.py)
+    // MARK: - High-Speed Point-to-Point Command Pipeline (严格对齐小程序 blanket.js & blanketto.js)
     @discardableResult
     @MainActor
-    public func sendCommand(_ cmdHex: String, to deviceID: UUID) async -> Bool {
-        guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return false }
-        let mac = devices[idx].macAddress
-        guard let keys = getCachedKeys(for: mac) else { return false }
-
+    public func sendCommand(_ cmdHex: String, to deviceID: UUID, useAltKey: Bool = false) async -> Bool {
         let ready = await ensureConnected(deviceID: deviceID)
         guard ready,
               let peripheral = activePeripherals[deviceID],
-              let characteristic = controlCharacteristics[deviceID] else {
+              let characteristic = controlCharacteristics[deviceID],
+              let resolvedKeys = resolveActiveSecretKey(for: deviceID) else {
             pendingCommandsAfterConnect[deviceID, default: []].append(cmdHex)
             return false
         }
 
-        // 若已经通过硬件 Notify 锁定了真实密钥，则只用锁定密钥发送；
-        // 若尚未锁定（例如广播提取的 MAC 与实际字节序相反），先用 primary 发送，若 160ms 内未收到 Notify 解密锁定，则自动用 alt 补发一次！
-        let activeKey = verifiedWorkingKeys[deviceID] ?? keys.primary
-        guard let cipherData = BlanketProtocol.encryptPayload(cmdHex: cmdHex, secretKey: activeKey) else {
+        let targetKey = useAltKey ? resolvedKeys.alt : resolvedKeys.active
+        guard let cipherData = BlanketProtocol.encryptPayload(cmdHex: cmdHex, secretKey: targetKey) else {
             return false
         }
 
         writeCipherData(cipherData, to: peripheral, characteristic: characteristic, deviceID: deviceID)
-
-        if verifiedWorkingKeys[deviceID] == nil {
-            let altKey = keys.alt
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 160_000_000)
-                guard let self = self,
-                      self.verifiedWorkingKeys[deviceID] == nil,
-                      let p = self.activePeripherals[deviceID],
-                      p.state == .connected,
-                      let c = self.controlCharacteristics[deviceID],
-                      let altCipher = BlanketProtocol.encryptPayload(cmdHex: cmdHex, secretKey: altKey) else {
-                    return
-                }
-                self.writeCipherData(altCipher, to: p, characteristic: c, deviceID: deviceID)
-            }
-        }
-
         return true
     }
 
@@ -454,16 +505,33 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         commandWriteStartTimes[deviceID] = Date()
         lastWrittenCipherPayloads[deviceID] = cipherData
 
-        // 严格复刻 blanket_client.py：若特征值支持 Write With Response 则优先使用，若报错或仅支持 Write Without Response 则无应答写入
-        if characteristic.properties.contains(.write) {
-            peripheral.writeValue(cipherData, for: characteristic, type: .withResponse)
-        } else {
+        // 严格对齐微信小程序 wx.writeBLECharacteristicValue 与 blanket_client.py：
+        // 若已知该外设需要无应答写入、或特征值仅支持 .writeWithoutResponse，则直接用 .withoutResponse；
+        // 若特征值支持 .write，则发送 .withResponse，同时如果 200ms 内未收到 didWriteValueFor 确认且特征值也支持 .writeWithoutResponse，自动无感兼容切换
+        if preferWriteWithoutResponse.contains(deviceID) && characteristic.properties.contains(.writeWithoutResponse) {
             peripheral.writeValue(cipherData, for: characteristic, type: .withoutResponse)
+        } else if characteristic.properties.contains(.write) {
+            peripheral.writeValue(cipherData, for: characteristic, type: .withResponse)
+            if !hasConfirmedWriteResponse.contains(deviceID) && characteristic.properties.contains(.writeWithoutResponse) {
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 220_000_000)
+                    guard let self = self,
+                          !self.hasConfirmedWriteResponse.contains(deviceID),
+                          let p = self.activePeripherals[deviceID],
+                          p.state == .connected,
+                          let c = self.controlCharacteristics[deviceID] else { return }
+                    self.preferWriteWithoutResponse.insert(deviceID)
+                    p.writeValue(cipherData, for: c, type: .withoutResponse)
+                }
+            }
+        } else if characteristic.properties.contains(.writeWithoutResponse) {
+            peripheral.writeValue(cipherData, for: characteristic, type: .withoutResponse)
+        } else {
+            peripheral.writeValue(cipherData, for: characteristic, type: .withResponse)
         }
-        peripheral.readRSSI()
     }
 
-    /// 复刻 `blanket_client.py` 的 `_schedule_delayed_query(delay)`，在控制指令下发后延时主动拉取硬件真实状态确认
+    /// 延时主动拉取硬件真实状态确认
     private func scheduleDelayedQuery(for deviceID: UUID, delaySeconds: Double = 0.55) {
         delayedQueryTasks[deviceID]?.cancel()
         delayedQueryTasks[deviceID] = Task { @MainActor [weak self] in
@@ -475,7 +543,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
     }
 
-    private func scheduleDebouncedCommand(key: String, delayMs: UInt64 = 120, action: @escaping @MainActor () async -> Void) {
+    private func scheduleDebouncedCommand(key: String, delayMs: UInt64 = 140, action: @escaping @MainActor () async -> Void) {
         debounceTasks[key]?.cancel()
         debounceTasks[key] = Task { @MainActor in
             try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
@@ -484,9 +552,9 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
     }
 
-    // MARK: - User & AppIntent Control Actions (严格对齐 blanket_client.py & ha_mqtt_bridge.py)
+    // MARK: - User & AppIntent Control Actions (严格对齐小程序 blanket.js / blanketto.js & ha_mqtt_bridge.py)
 
-    /// 1. 开关电热毯电源（内置开机 0.35s 自动恢复上次挡位与定时记忆，并在 0.6s 后主动查询硬件状态）
+    /// 1. 开关电热毯电源（内置开机后恢复上次挡位与定时记忆，并在操作后主动查询硬件状态）
     @MainActor
     public func setPower(isOn: Bool, for deviceID: UUID) async {
         guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return }
@@ -524,18 +592,19 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                 let targetRight = devices[currentIdx].savedGearRight
                 let targetClose = devices[currentIdx].savedTimeCloseHours
 
-                try? await Task.sleep(nanoseconds: 350_000_000)
+                // 留出 450ms 避开电热毯通电复位与初始状态 Notify 包突发，随后依序恢复左右温区挡位与定时
+                try? await Task.sleep(nanoseconds: 450_000_000)
                 await sendCommand(BlanketProtocol.cmdGearLeft(targetLeft), to: deviceID)
-                try? await Task.sleep(nanoseconds: 200_000_000)
+                try? await Task.sleep(nanoseconds: 220_000_000)
                 await sendCommand(BlanketProtocol.cmdGearRight(targetRight), to: deviceID)
-                try? await Task.sleep(nanoseconds: 200_000_000)
+                try? await Task.sleep(nanoseconds: 220_000_000)
                 await sendCommand(BlanketProtocol.cmdTimeClose(hours: targetClose), to: deviceID)
             }
             isPoweringOnRestoringMemory.remove(deviceID)
-            scheduleDelayedQuery(for: deviceID, delaySeconds: 0.6)
+            scheduleDelayedQuery(for: deviceID, delaySeconds: 0.65)
         } else {
             await sendCommand(BlanketProtocol.cmdPower(isOn: false), to: deviceID)
-            scheduleDelayedQuery(for: deviceID, delaySeconds: 0.5)
+            scheduleDelayedQuery(for: deviceID, delaySeconds: 0.55)
         }
     }
 
@@ -554,15 +623,19 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         let taskAction: @MainActor () async -> Void = { [weak self] in
             guard let self = self else { return }
             if let cIdx = self.devices.firstIndex(where: { $0.id == deviceID }), !self.devices[cIdx].isOn {
-                await self.setPower(isOn: true, for: deviceID)
-            } else {
-                await self.sendCommand(BlanketProtocol.cmdGearLeft(clamped), to: deviceID)
-                if shouldSyncRight {
-                    try? await Task.sleep(nanoseconds: 180_000_000)
-                    await self.sendCommand(BlanketProtocol.cmdGearRight(clamped), to: deviceID)
+                self.devices[cIdx].isOn = true
+                if self.devices[cIdx].currentSessionStartDate == nil {
+                    self.devices[cIdx].currentSessionStartDate = Date()
                 }
-                self.scheduleDelayedQuery(for: deviceID, delaySeconds: 0.5)
+                await self.sendCommand(BlanketProtocol.cmdPower(isOn: true), to: deviceID)
+                try? await Task.sleep(nanoseconds: 350_000_000)
             }
+            await self.sendCommand(BlanketProtocol.cmdGearLeft(clamped), to: deviceID)
+            if shouldSyncRight {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                await self.sendCommand(BlanketProtocol.cmdGearRight(clamped), to: deviceID)
+            }
+            self.scheduleDelayedQuery(for: deviceID, delaySeconds: 0.55)
         }
 
         if debounced {
@@ -587,15 +660,19 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         let taskAction: @MainActor () async -> Void = { [weak self] in
             guard let self = self else { return }
             if let cIdx = self.devices.firstIndex(where: { $0.id == deviceID }), !self.devices[cIdx].isOn {
-                await self.setPower(isOn: true, for: deviceID)
-            } else {
-                await self.sendCommand(BlanketProtocol.cmdGearRight(clamped), to: deviceID)
-                if shouldSyncLeft {
-                    try? await Task.sleep(nanoseconds: 180_000_000)
-                    await self.sendCommand(BlanketProtocol.cmdGearLeft(clamped), to: deviceID)
+                self.devices[cIdx].isOn = true
+                if self.devices[cIdx].currentSessionStartDate == nil {
+                    self.devices[cIdx].currentSessionStartDate = Date()
                 }
-                self.scheduleDelayedQuery(for: deviceID, delaySeconds: 0.5)
+                await self.sendCommand(BlanketProtocol.cmdPower(isOn: true), to: deviceID)
+                try? await Task.sleep(nanoseconds: 350_000_000)
             }
+            await self.sendCommand(BlanketProtocol.cmdGearRight(clamped), to: deviceID)
+            if shouldSyncLeft {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                await self.sendCommand(BlanketProtocol.cmdGearLeft(clamped), to: deviceID)
+            }
+            self.scheduleDelayedQuery(for: deviceID, delaySeconds: 0.55)
         }
 
         if debounced {
@@ -617,10 +694,15 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             devices[idx].remainingTimeCloseSec = 2 * 3600
         }
         if !devices[idx].isOn {
-            await setPower(isOn: true, for: deviceID)
+            devices[idx].isOn = true
+            if devices[idx].currentSessionStartDate == nil {
+                devices[idx].currentSessionStartDate = Date()
+            }
+            await sendCommand(BlanketProtocol.cmdPower(isOn: true), to: deviceID)
+            try? await Task.sleep(nanoseconds: 350_000_000)
         }
         await sendCommand(BlanketProtocol.cmdMode(mode), to: deviceID)
-        scheduleDelayedQuery(for: deviceID, delaySeconds: 0.5)
+        scheduleDelayedQuery(for: deviceID, delaySeconds: 0.55)
     }
 
     /// 5. 设置自动关机定时 (1~12 小时)
@@ -633,7 +715,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         devices[idx].remainingTimeCloseSec = clamped * 3600
         await sendCommand(BlanketProtocol.cmdTimeClose(hours: clamped), to: deviceID)
         PushNotificationManager.shared.scheduleBackgroundHardwareTimerNotifications(for: devices[idx])
-        scheduleDelayedQuery(for: deviceID, delaySeconds: 0.5)
+        scheduleDelayedQuery(for: deviceID, delaySeconds: 0.55)
     }
 
     /// 6. 设置预约开机定时 (0~12 小时，0 为关闭预约)
@@ -645,13 +727,33 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         devices[idx].remainingTimeOpenSec = clamped * 3600
         await sendCommand(BlanketProtocol.cmdTimeOpen(hours: clamped), to: deviceID)
         PushNotificationManager.shared.scheduleBackgroundHardwareTimerNotifications(for: devices[idx])
-        scheduleDelayedQuery(for: deviceID, delaySeconds: 0.5)
+        scheduleDelayedQuery(for: deviceID, delaySeconds: 0.55)
     }
 
-    /// 7. 主动查询硬件实时状态（严格使用 blanket_protocol.py 验证过的 5 属性查询指令 `000400050152979899`）
+    /// 7. 主动查询硬件实时状态（严格对齐小程序 blanket.js / blanketto.js 的 notifyReadWrite 查询逻辑）
     @MainActor
     public func queryStatus(for deviceID: UUID) async {
-        await sendCommand(BlanketProtocol.queryCoreStatusCmd, to: deviceID)
+        let pid = deviceProductIDs[deviceID]
+        let primaryQueryCmd = BlanketProtocol.queryCommand(forProductId: pid)
+        let syncBefore = devices.first(where: { $0.id == deviceID })?.lastSyncDate
+
+        await sendCommand(primaryQueryCmd, to: deviceID, useAltKey: false)
+
+        // 如果 450ms 内未收到任何硬件状态回包（例如固件仅识别 5 属性查询指令 000400050152979899，或用户手动输入了正序 MAC），自动回退探测
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            guard let self = self,
+                  let idx = self.devices.firstIndex(where: { $0.id == deviceID }),
+                  self.connectionPhases[deviceID] == .connected else { return }
+
+            if self.devices[idx].lastSyncDate == syncBefore {
+                if primaryQueryCmd != BlanketProtocol.queryCoreStatusCmd {
+                    await self.sendCommand(BlanketProtocol.queryCoreStatusCmd, to: deviceID, useAltKey: false)
+                } else if self.verifiedWorkingKeys[deviceID] == nil {
+                    await self.sendCommand(BlanketProtocol.queryCoreStatusCmd, to: deviceID, useAltKey: true)
+                }
+            }
+        }
     }
 
     // MARK: - 1-Second Runtime & Foreground Live Sync Ticker
@@ -686,10 +788,10 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             }
         }
 
-        // 在前台期间，每 15 秒发送一次 queryCoreStatusCmd 保活并同步物理线控状态（加上 Notify 实时推送双保障）
+        // 在前台期间，每 15 秒发送一次状态查询保活并同步物理线控状态（加上 Notify 实时推送双保障）
         if !isAppInBackground && pollCounter >= 15 {
             pollCounter = 0
-            if let activeID = activeDeviceID {
+            if let activeID = activeDeviceID, connectionPhases[activeID] == .connected {
                 Task { @MainActor [weak self] in
                     await self?.queryStatus(for: activeID)
                 }
@@ -697,24 +799,68 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
     }
 
-    // MARK: - Handle Decrypted Notification Payload & Lock Verified DES Key
-    private func handleIncomingNotification(data: Data, for deviceID: UUID) {
-        guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return }
-        let mac = devices[idx].macAddress
-        guard let keys = getCachedKeys(for: mac) else { return }
+    // MARK: - Complete Notify Handshake & Trigger Initial Status Query (严格复刻小程序 notifyReadWrite)
+    @MainActor
+    private func completeConnectionReady(for deviceID: UUID) {
+        notifyReadyFallbackTasks[deviceID]?.cancel()
+        notifyReadyFallbackTasks.removeValue(forKey: deviceID)
 
-        // 分别尝试 primary (小端反转 MAC + 5700) 与 alt (正序 MAC + 5700)，一旦匹配已知 TLV 前缀立即锁定 verifiedWorkingKeys!
+        let isFirstHandshake = !hasCompletedNotifyHandshake.contains(deviceID)
+        hasCompletedNotifyHandshake.insert(deviceID)
+        connectionPhases[deviceID] = .connected
+        stopScanning()
+
+        let list = connectionContinuations.removeValue(forKey: deviceID) ?? []
+        for cont in list {
+            cont.resume(returning: true)
+        }
+
+        if isFirstHandshake {
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                // 留出 60ms 让恢复的 continuation（若为 sendCommand 控制调用）先行发送，避免与初始 queryStatus 并发碰撞
+                try? await Task.sleep(nanoseconds: 60_000_000)
+                if let queued = self.pendingCommandsAfterConnect.removeValue(forKey: deviceID), !queued.isEmpty {
+                    for cmd in queued {
+                        await self.sendCommand(cmd, to: deviceID)
+                        try? await Task.sleep(nanoseconds: 180_000_000)
+                    }
+                }
+                if let lastWrite = self.commandWriteStartTimes[deviceID],
+                   Date().timeIntervalSince(lastWrite) < 0.25 {
+                    self.scheduleDelayedQuery(for: deviceID, delaySeconds: 0.5)
+                } else {
+                    await self.queryStatus(for: deviceID)
+                }
+            }
+        }
+    }
+
+    // MARK: - Handle Decrypted Notification Payload & Lock Verified DES Key (严格复刻小程序 setBleData)
+    private func handleIncomingNotification(data: Data, for deviceID: UUID) {
+        guard let idx = devices.firstIndex(where: { $0.id == deviceID }),
+              let resolvedKeys = resolveActiveSecretKey(for: deviceID) else { return }
+
+        // 1. 先尝试当前激活密钥（广播 CRC16 精确密钥或小端反转密钥），再尝试备用正序密钥，一旦匹配已知 TLV 前缀立即锁定 verifiedWorkingKeys
         var matchedHex: String?
-        if let decPrimary = BlanketProtocol.decryptPayload(cipherBytes: data, secretKey: keys.primary, altKey: nil),
-           BlanketProtocol.knownPrefixes.contains(where: { decPrimary.hasPrefix($0) }) {
-            matchedHex = decPrimary
-            verifiedWorkingKeys[deviceID] = keys.primary
-        } else if let decAlt = BlanketProtocol.decryptPayload(cipherBytes: data, secretKey: keys.alt, altKey: nil),
+        if let decActive = BlanketProtocol.decryptPayload(cipherBytes: data, secretKey: resolvedKeys.active, altKey: nil),
+           BlanketProtocol.knownPrefixes.contains(where: { decActive.hasPrefix($0) }) {
+            matchedHex = decActive
+            verifiedWorkingKeys[deviceID] = resolvedKeys.active
+        } else if let decAlt = BlanketProtocol.decryptPayload(cipherBytes: data, secretKey: resolvedKeys.alt, altKey: nil),
                   BlanketProtocol.knownPrefixes.contains(where: { decAlt.hasPrefix($0) }) {
             matchedHex = decAlt
-            verifiedWorkingKeys[deviceID] = keys.alt
-        } else {
-            matchedHex = BlanketProtocol.decryptPayload(cipherBytes: data, secretKey: keys.primary, altKey: keys.alt)
+            verifiedWorkingKeys[deviceID] = resolvedKeys.alt
+        } else if let macPair = getCachedKeys(for: devices[idx].macAddress) {
+            if let decPrimary = BlanketProtocol.decryptPayload(cipherBytes: data, secretKey: macPair.primary, altKey: nil),
+               BlanketProtocol.knownPrefixes.contains(where: { decPrimary.hasPrefix($0) }) {
+                matchedHex = decPrimary
+                verifiedWorkingKeys[deviceID] = macPair.primary
+            } else if let decFallback = BlanketProtocol.decryptPayload(cipherBytes: data, secretKey: macPair.alt, altKey: nil),
+                      BlanketProtocol.knownPrefixes.contains(where: { decFallback.hasPrefix($0) }) {
+                matchedHex = decFallback
+                verifiedWorkingKeys[deviceID] = macPair.alt
+            }
         }
 
         guard let decryptedHex = matchedHex else { return }
@@ -733,35 +879,57 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         if let isOn = tlv.isOn {
             devices[idx].isOn = isOn
             if !wasOn && isOn {
-                // 物理线控手动开机：补充开机默认属性 (左右温区9挡, 定时12小时)，并在 0.5s 后查询全状态
+                // 物理线控手动开机（对应小程序 setDefaultState(1)）：默认重置为普通模式、左右温区 9 挡、定时 12 小时，并主动拉取最新状态
                 devices[idx].currentSessionStartDate = Date()
                 devices[idx].totalPowerOnCount += 1
+                devices[idx].timeOpenHours = 0
+                devices[idx].remainingTimeOpenSec = 0
                 if tlv.gearLeft == nil { devices[idx].gearLeft = 9 }
                 if tlv.gearRight == nil { devices[idx].gearRight = 9 }
                 if tlv.timeCloseHours == nil { devices[idx].timeCloseHours = 12 }
                 if tlv.mode == nil { devices[idx].mode = .normal }
-                scheduleDelayedQuery(for: deviceID, delaySeconds: 0.5)
+                if devices[idx].remainingTimeCloseSec == 0 {
+                    devices[idx].remainingTimeCloseSec = devices[idx].timeCloseHours * 3600
+                }
+                scheduleDelayedQuery(for: deviceID, delaySeconds: 0.45)
             } else if wasOn && !isOn {
                 if let start = devices[idx].currentSessionStartDate {
                     devices[idx].accumulatedRuntimeSeconds += max(0, Date().timeIntervalSince(start))
                 }
                 devices[idx].currentSessionStartDate = nil
+                devices[idx].remainingTimeCloseSec = 0
             }
         }
 
         if let mode = tlv.mode {
             devices[idx].mode = mode
+            // 对应小程序 setMiteState(1)：切换至除螨模式时，自动同步为 2 小时定时与左右 9 挡
+            if mode == .miteRemoval {
+                devices[idx].gearLeft = 9
+                devices[idx].gearRight = 9
+                devices[idx].timeCloseHours = 2
+                if devices[idx].remainingTimeCloseSec == 0 || devices[idx].remainingTimeCloseSec > 2 * 3600 {
+                    devices[idx].remainingTimeCloseSec = 2 * 3600
+                }
+            }
         }
         if let gl = tlv.gearLeft {
             devices[idx].gearLeft = gl
             if devices[idx].isOn && !isPoweringOnRestoringMemory.contains(deviceID) {
                 devices[idx].savedGearLeft = gl
             }
+            // 若用户在实体按键上调节了挡位（仅开机状态可调挡），而本地状态尚未同步为开机，则立即触发一次全状态查询
+            if !devices[idx].isOn && tlv.isOn == nil {
+                scheduleDelayedQuery(for: deviceID, delaySeconds: 0.25)
+            }
         }
         if let gr = tlv.gearRight {
             devices[idx].gearRight = gr
             if devices[idx].isOn && !isPoweringOnRestoringMemory.contains(deviceID) {
                 devices[idx].savedGearRight = gr
+            }
+            if !devices[idx].isOn && tlv.isOn == nil {
+                scheduleDelayedQuery(for: deviceID, delaySeconds: 0.25)
             }
         }
         if let tc = tlv.timeCloseHours, tc > 0 {
@@ -775,6 +943,9 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
         if let to = tlv.timeOpenHours {
             devices[idx].timeOpenHours = to
+            if to == 0 {
+                devices[idx].remainingTimeOpenSec = 0
+            }
         }
         if let remOpen = tlv.remainingTimeOpenSec {
             devices[idx].remainingTimeOpenSec = remOpen
@@ -827,8 +998,8 @@ extension BlanketBLEManager: CBCentralManagerDelegate, CBPeripheralDelegate {
             guard let self = self else { return }
             self.bluetoothState = state
             if state == .poweredOn,
-               !self.isAppInBackground,
-               let activeID = self.activeDeviceID {
+                !self.isAppInBackground,
+                let activeID = self.activeDeviceID {
                 Task { @MainActor in
                     await self.ensureConnected(deviceID: activeID)
                 }
@@ -849,53 +1020,109 @@ extension BlanketBLEManager: CBCentralManagerDelegate, CBPeripheralDelegate {
         let serviceDataDict = (advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data]) ?? [:]
 
         let isNameJ = localName.uppercased().hasPrefix("J")
-        let has5700UUID = serviceUUIDs.contains { $0.uuidString.lowercased().contains("5700") }
-        let has5700Data = serviceDataDict.keys.contains { $0.uuidString.lowercased().contains("5700") }
-        let isJingHe = isNameJ || has5700UUID || has5700Data
+        let has5700UUID = serviceUUIDs.contains {
+            let u = $0.uuidString.uppercased()
+            return u.contains("5700") || u.contains("5703") || u.contains("5704") || u.contains("1218")
+        }
+        let has5700Data = serviceDataDict.keys.contains {
+            let u = $0.uuidString.uppercased()
+            return u.contains("5700") || u.contains("5704") || u.contains("1218")
+        }
 
-        var extractedMAC: String?
+        // 严格复刻微信小程序 behaviors/bleBehaviors.js -> filterDeviceList：
+        // 1. 优先从 0x5700 Service Data (14 字节) 执行 CRC16 校验并提取 pid 与 rawMacHex (deviceManufactCode)
+        var parsedAdv: BlanketProtocol.ParsedAdvertisementInfo?
         var serviceHex: String?
-        for (uuid, data) in serviceDataDict where uuid.uuidString.lowercased().contains("5700") {
-            serviceHex = data.hexEncodedString()
-            extractedMAC = BlanketProtocol.extractMACFromAdvertisement(serviceData: data)
-        }
-        if extractedMAC == nil,
-           let mfgData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data {
-            extractedMAC = BlanketProtocol.extractMACFromAdvertisement(serviceData: mfgData)
+        for (_, data) in serviceDataDict {
+            if let info = BlanketProtocol.parseServiceData5700(data) {
+                parsedAdv = info
+                serviceHex = data.hexEncodedString()
+                break
+            }
         }
 
+        // 2. 仅当存在 0x5703/0x5678/0x5679 格式且通过 checkCrc16(mfgData.dropFirst()) 校验时才从 ManufacturerData 提取，绝不盲目截取普通厂商数据！
+        if parsedAdv == nil,
+           let mfgData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
+           let info = BlanketProtocol.parseVerifiedManufacturerData(mfgData) {
+            parsedAdv = info
+            serviceHex = mfgData.hexEncodedString()
+        }
+
+        let isJingHe = (parsedAdv != nil) || has5700UUID || has5700Data || isNameJ
         let rssiVal = RSSI.intValue
         let pID = peripheral.identifier
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            // 始终在内存中强引用缓存发现的 CBPeripheral，防止 CoreBluetooth 释放外设导致连接无响应
             self.discoveredPeripheralObjects[pID] = peripheral
 
+            // 缓存从 CRC16 广播包提取出的 100% 精确 DES 密钥、PID 与标准 MAC
+            if let info = parsedAdv {
+                self.peripheralBroadcastKeys[pID] = info.exactSecretKey
+                self.peripheralProductIDs[pID] = info.productId
+                self.peripheralDisplayMACs[pID] = info.displayMAC
+            }
+
+            // 匹配正在等待连接的设备（严格遵循小程序 startConnectDevice 的 MAC/ServiceData 匹配原则）
             if isJingHe,
-               let waitingIdx = self.devices.firstIndex(where: {
-                   self.connectionPhases[$0.id] == .connecting ||
-                   $0.peripheralUUIDString == pID.uuidString ||
-                   $0.peripheralUUIDString == nil
+               let waitingIdx = self.devices.firstIndex(where: { dev in
+                   if let info = parsedAdv {
+                       let devCleanMac = dev.macAddress.replacingOccurrences(of: ":", with: "").lowercased()
+                       if devCleanMac == info.rawMacHex || dev.macAddress.caseInsensitiveCompare(info.displayMAC) == .orderedSame {
+                           return true
+                       }
+                   }
+                   return self.connectionPhases[dev.id] == .connecting ||
+                          dev.peripheralUUIDString == pID.uuidString ||
+                          dev.peripheralUUIDString == nil
                }) {
                 let targetID = self.devices[waitingIdx].id
-                if let mac = extractedMAC {
-                    self.devices[waitingIdx].macAddress = mac
-                    _ = self.getCachedKeys(for: mac)
-                }
-                if self.activePeripherals[targetID]?.state != .connected {
-                    self.bindAndConnect(peripheral: peripheral, to: targetID)
+
+                if let info = parsedAdv {
+                    // 收到通过 CRC16 校验的 0x5700 Service Data：立即锁定精确 DES 密钥与 PID 并建立连接
+                    self.devices[waitingIdx].macAddress = info.displayMAC
+                    self.verifiedWorkingKeys[targetID] = info.exactSecretKey
+                    self.deviceProductIDs[targetID] = info.productId
+                    _ = self.getCachedKeys(for: info.displayMAC)
+
+                    if self.activePeripherals[targetID]?.state != .connected {
+                        self.bindAndConnect(peripheral: peripheral, to: targetID)
+                    }
+                } else if (has5700UUID || has5700Data),
+                          self.activePeripherals[targetID]?.state != .connected,
+                          self.pendingScanConnectTasks[targetID] == nil {
+                    // 当前仅收到 ADV_IND 主广播包，留出 320ms 等待包含 0x5700 Service Data 的 SCAN_RSP 扫描响应包到达后再连接
+                    self.pendingScanConnectTasks[targetID] = Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: 320_000_000)
+                        guard !Task.isCancelled,
+                              let self = self,
+                              self.activePeripherals[targetID]?.state != .connected else { return }
+                        self.bindAndConnect(peripheral: peripheral, to: targetID)
+                    }
                 }
             }
 
             guard !localName.isEmpty || isJingHe else { return }
+
+            // 合并同一外设的 ADV_IND 与 SCAN_RSP 广播信息，绝不用不含 ServiceData 的广播帧覆盖已提取的 MAC
+            let existing = self.discoveredPeripherals.first(where: { $0.id == pID })
+            let mergedName: String = {
+                if !localName.isEmpty { return localName }
+                if let prevName = existing?.name, !prevName.isEmpty { return prevName }
+                return "晶合蓝牙电热毯"
+            }()
+            let mergedMAC = parsedAdv?.displayMAC ?? self.peripheralDisplayMACs[pID] ?? existing?.extractedMAC
+            let mergedServiceHex = serviceHex ?? existing?.serviceDataHex
+            let mergedIsJingHe = isJingHe || (existing?.isJingHeBlanket ?? false)
+
             let item = DiscoveredBLEBlanket(
                 id: pID,
-                name: localName.isEmpty ? "晶合蓝牙电热毯" : localName,
-                extractedMAC: extractedMAC,
-                rssi: (rssiVal == 127 ? -65 : rssiVal),
-                isJingHeBlanket: isJingHe,
-                serviceDataHex: serviceHex,
+                name: mergedName,
+                extractedMAC: mergedMAC,
+                rssi: (rssiVal == 127 ? (existing?.rssi ?? -65) : rssiVal),
+                isJingHeBlanket: mergedIsJingHe,
+                serviceDataHex: mergedServiceHex,
                 lastSeen: Date()
             )
 
@@ -911,8 +1138,8 @@ extension BlanketBLEManager: CBCentralManagerDelegate, CBPeripheralDelegate {
         let pID = peripheral.identifier
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let deviceID = self.peripheralToDeviceMap[pID] else { return }
-            // 每次物理连接建立后必须重新发现服务与特征值（不可复用断连前的旧 CBCharacteristic 句柄，否则写入与通知均被 CoreBluetooth 静默丢弃）
             self.controlCharacteristics.removeValue(forKey: deviceID)
+            self.hasCompletedNotifyHandshake.remove(deviceID)
             peripheral.delegate = self
             peripheral.readRSSI()
             peripheral.discoverServices(nil)
@@ -941,6 +1168,8 @@ extension BlanketBLEManager: CBCentralManagerDelegate, CBPeripheralDelegate {
         let pID = peripheral.identifier
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let deviceID = self.peripheralToDeviceMap[pID] else { return }
+            self.notifyReadyFallbackTasks[deviceID]?.cancel()
+            self.hasCompletedNotifyHandshake.remove(deviceID)
             self.controlCharacteristics.removeValue(forKey: deviceID)
             self.connectionPhases[deviceID] = .disconnected
 
@@ -972,26 +1201,19 @@ extension BlanketBLEManager: CBCentralManagerDelegate, CBPeripheralDelegate {
         for characteristic in characteristics {
             let uuidUpper = characteristic.uuid.uuidString.uppercased()
             if uuidUpper.contains("4A486201") || uuidUpper == "6201" {
+                // 严格对齐微信小程序 notifyReadWrite：先开启特征值 Notify 订阅，等待 didUpdateNotificationStateFor 完成后再下发指令
                 peripheral.setNotifyValue(true, for: characteristic)
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self, let deviceID = self.peripheralToDeviceMap[pID] else { return }
                     self.controlCharacteristics[deviceID] = characteristic
-                    self.connectionPhases[deviceID] = .connected
-                    self.stopScanning()
 
-                    let list = self.connectionContinuations.removeValue(forKey: deviceID) ?? []
-                    for cont in list { cont.resume(returning: true) }
-
-                    Task { @MainActor [weak self] in
-                        guard let self = self else { return }
-                        // 留出 80ms 等待 CCCD (setNotifyValue) 订阅生效后，立即下发 5 属性状态查询指令
-                        try? await Task.sleep(nanoseconds: 80_000_000)
-                        await self.queryStatus(for: deviceID)
-                        if let queued = self.pendingCommandsAfterConnect.removeValue(forKey: deviceID) {
-                            for cmd in queued {
-                                try? await Task.sleep(nanoseconds: 160_000_000)
-                                await self.sendCommand(cmd, to: deviceID)
-                            }
+                    // 保底定时器：若 iOS 缓存了 CCCD 状态未在 380ms 内触发 didUpdateNotificationStateFor，则自动完成握手
+                    self.notifyReadyFallbackTasks[deviceID]?.cancel()
+                    self.notifyReadyFallbackTasks[deviceID] = Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: 380_000_000)
+                        guard !Task.isCancelled, let self = self else { return }
+                        if !self.hasCompletedNotifyHandshake.contains(deviceID) {
+                            self.completeConnectionReady(for: deviceID)
                         }
                     }
                 }
@@ -1007,10 +1229,12 @@ extension BlanketBLEManager: CBCentralManagerDelegate, CBPeripheralDelegate {
         let pID = peripheral.identifier
         DispatchQueue.main.async { [weak self] in
             guard let self = self,
-                  let deviceID = self.peripheralToDeviceMap[pID],
-                  characteristic.isNotifying else { return }
+                  let deviceID = self.peripheralToDeviceMap[pID] else { return }
+            let uuidUpper = characteristic.uuid.uuidString.uppercased()
+            guard uuidUpper.contains("4A486201") || uuidUpper == "6201" else { return }
+
             Task { @MainActor [weak self] in
-                await self?.queryStatus(for: deviceID)
+                self?.completeConnectionReady(for: deviceID)
             }
         }
     }
@@ -1036,10 +1260,12 @@ extension BlanketBLEManager: CBCentralManagerDelegate, CBPeripheralDelegate {
         let pID = peripheral.identifier
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let deviceID = self.peripheralToDeviceMap[pID] else { return }
-            // 严格复刻 blanket_client.py：若带应答写入 (.withResponse) 报错，立即自动回退为无应答写入 (.withoutResponse)
-            if error != nil,
-               characteristic.properties.contains(.writeWithoutResponse),
-               let fallbackData = self.lastWrittenCipherPayloads[deviceID] {
+            if error == nil {
+                self.hasConfirmedWriteResponse.insert(deviceID)
+            } else if characteristic.properties.contains(.writeWithoutResponse),
+                      let fallbackData = self.lastWrittenCipherPayloads[deviceID] {
+                // 若带应答写入 (.withResponse) 报错，立即自动回退为无应答写入 (.withoutResponse) 并记忆该偏好
+                self.preferWriteWithoutResponse.insert(deviceID)
                 peripheral.writeValue(fallbackData, for: characteristic, type: .withoutResponse)
             }
             if let writeStart = self.commandWriteStartTimes[deviceID] {
