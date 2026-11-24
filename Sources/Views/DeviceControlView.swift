@@ -1,11 +1,9 @@
 import SwiftUI
 
 /// 温控中心主视图 (`DeviceControlView`)
-/// 严格执行最新 UI 优化要求：
-/// 1. 顶部温区卡片：挡位与温度位置互换（右上角显示温度 `XX°C`，卡片中央主显示区采用 SwiftUI 原生拨轮控件 `.pickerStyle(.wheel)`，可直接上下滚动数字 1~9 挡来丝滑调节挡位）；
-/// 2. 顶部新增「快捷关机定时」液态玻璃操作卡片，且顶部所有大卡片的左右边距与底下 `List` Section 组件 100% 严格对齐（通过内 `+12pt` 阴影缓冲与外 `-12pt` 负边距抵消，既不裁切阴影又严丝合缝对齐）；
-/// 3. 下方「定时关机与预约开机」中的下拉菜单改为 SwiftUI 原生拨轮控件 `.pickerStyle(.wheel)`（类似倒计时拨轮），而下方一横排的时间快捷按钮 (`2h / 4h / 6h / 8h / 10h / 12h`) 保持原样不动；
-/// 4. 列表往上滑动时，除了底部 Tab 自动收起，悬浮的「开关电热毯」与「切换除螨模式」按钮也会同步收起为纯圆形图标按钮（隐藏文字显示）。
+/// 修复顶部大卡片与状态胶囊边缘阴影被 List Section 裁切的问题：
+/// - 采用 iOS 26 原生 `.listSectionMargins(.horizontal, 0)` 将顶部 Section 容器扩展至屏幕全宽，消除 20pt 处的硬裁剪边界
+/// - 在 `GlassEffectContainer` 内部及下方卡片设置 `.padding(.horizontal, 20)` 与充足上下内边距，使所有顶部大卡片左右边缘与下方标准 Section (20pt 边距) 100% 严格对齐，同时外发光阴影在 0~20pt 缓冲带内完整渲染、绝不截断
 public struct DeviceControlView: View {
     @ObservedObject var bleManager: BlanketBLEManager
     let deviceID: UUID
@@ -52,10 +50,11 @@ public struct DeviceControlView: View {
 
     public var body: some View {
         List {
-            // MARK: 1. 顶部双温区拨轮卡片 + 顶部快捷关机定时大卡片 + 独立状态胶囊（左右边距与下方组件严格对齐）
+            // MARK: 1. 顶部双温区拨轮卡片 + 顶部快捷关机定时大卡片 + 独立状态胶囊（全宽 Section 不裁切阴影 + 20pt 内边距与下方严格对齐）
             Section {
                 liquidGlassMorphingHeroHeader
             }
+            .listSectionMargins(.horizontal, 0)
             .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
@@ -349,11 +348,11 @@ public struct DeviceControlView: View {
     }
 
     // MARK: - 顶部双温区拨轮卡片 + 顶部快捷关机定时大卡片 + 独立无粘连状态胶囊
-    /// 采用内部 `+12pt` 阴影采样缓冲 + 外部 `-12pt` 负边距补偿：
-    /// 既保证了 `GlassEffectContainer` 边缘阴影 100% 不被截断，又让大卡片左右外边缘与下方 `List` Section 100% 像素级对齐！
+    /// 配合 Section 的 `.listSectionMargins(.horizontal, 0)`（全屏宽度不裁切），
+    /// 在内部使用标准 `.padding(.horizontal, 20)`，使卡片左右边缘与下方 `.insetGrouped` Section 100% 对齐，且四周留出 16~20pt 阴影渲染空间！
     private var liquidGlassMorphingHeroHeader: some View {
-        VStack(spacing: 14) {
-            // 1. 左右温区拨轮大卡片（右上角显示温度 °C，中央为原生 Wheel 拨轮直接上下滑动调节 1~9 挡）
+        VStack(spacing: 0) {
+            // 1. 左右温区拨轮大卡片
             GlassEffectContainer(spacing: 6) {
                 Group {
                     if device.syncDualZones {
@@ -401,17 +400,19 @@ public struct DeviceControlView: View {
                         }
                     }
                 }
-                .padding(12)
+                .padding(.horizontal, 20)
+                .padding(.top, 16)
+                .padding(.bottom, 14)
             }
-            .padding(.horizontal, -12)
-            .padding(.bottom, -10)
 
-            // 2. 顶部新增：快捷关机定时大卡片（左右边缘与上方温区大卡片及下方 Section 完全对齐）
+            // 2. 顶部快捷关机定时大卡片（四周保留充足阴影空间，左右 20pt 与上方温区及下方组件严格对齐）
             quickAutoOffTimerHeroCard
                 .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
+                .padding(.horizontal, 20)
+                .padding(.bottom, 14)
 
-            // 3. 待机/已开启状态与预约/定时状态胶囊：移出 GlassEffectContainer 独立渲染，无玻璃粘连，左右与卡片完全对齐
-            HStack(spacing: 12) {
+            // 3. 待机/已开启状态与预约/定时状态胶囊：独立渲染无玻璃粘连，四周预留阴影缓冲
+            HStack(spacing: 14) {
                 Label(device.compactElapsedString(at: currentTime), systemImage: "clock.fill")
                     .font(.caption.weight(.semibold).monospacedDigit())
                     .contentTransition(.numericText())
@@ -433,7 +434,8 @@ public struct DeviceControlView: View {
                 .padding(.vertical, 10)
                 .glassEffect(.regular.interactive(), in: .capsule)
             }
-            .padding(.bottom, 10)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 18)
         }
     }
 

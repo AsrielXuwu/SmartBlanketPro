@@ -4,17 +4,27 @@ import UserNotifications
 import CryptoKit
 
 /// Apple 官方 APNs (Apple Push Notification service) 与本地实时状态推送中心
-/// 针对拥有推送权限 (aps-environment) 的自签证书与 iOS 26/27 原生通知设计：
-/// 1. 启动时向 Apple APNs 服务器注册并获取真实 64 位 Hex `deviceToken`；
-/// 2. 支持配置 Apple Developer `.p8` Auth Key (Key ID / Team ID / Private Key)，使用 iOS 原生 `CryptoKit` (`P256.Signing`) 签发 ES256 JWT，直接通过 HTTP/2 请求 Apple 官方 `https://api.push.apple.com/3/device/<token>` 推送电热毯实时状态；
-/// 3. 同时结合 `UNUserNotificationCenter` 提供毫秒级状态变更推送与后台定时到点（预约开机触发、自动关机完成、除螨完成）精准提醒。
+/// 修复 `@UIApplicationDelegateAdaptor` 独立实例与 `PushNotificationManager.shared` 单例状态不同步导致状态一直显示“等待获取 APNs 令牌...”的问题：
+/// - 所有 UIApplicationDelegate 回调统一同步更新 `PushNotificationManager.shared`
+/// - 当 `apnsDeviceToken` 已获取时，`effectiveStatusText` 立即显示“已成功接入 Apple 官方 APNs”并反馈最新推送投递状态
 public final class PushNotificationManager: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate, ObservableObject, @unchecked Sendable {
     public static let shared = PushNotificationManager()
 
     // MARK: - Published APNs State
     @Published public var apnsDeviceToken: String = UserDefaults.standard.string(forKey: "com.smartblanketpro.apns_token") ?? ""
     @Published public var isPushAuthorized: Bool = false
-    @Published public var apnsStatusMessage: String = "等待获取 APNs 令牌..."
+    @Published public var apnsStatusMessage: String = ""
+
+    /// 计算当前真实 APNs 状态描述（彻底避免已拿到 Token 却仍显示“等待获取 APNs 令牌”的问题）
+    public var effectiveStatusText: String {
+        if !apnsStatusMessage.isEmpty {
+            return apnsStatusMessage
+        }
+        if !apnsDeviceToken.isEmpty {
+            return "已成功接入 Apple 官方 APNs"
+        }
+        return "正在向 Apple APNs 请求令牌..."
+    }
 
     /// 用户可选配置的 Apple 官方 APNs HTTP/2 (.p8 Token-Based) 直推参数
     @Published public var apnsTeamID: String = UserDefaults.standard.string(forKey: "com.smartblanketpro.apns_team_id") ?? "" {
@@ -35,6 +45,12 @@ public final class PushNotificationManager: NSObject, UIApplicationDelegate, UNU
 
     public override init() {
         super.init()
+        let savedToken = UserDefaults.standard.string(forKey: "com.smartblanketpro.apns_token") ?? ""
+        if !savedToken.isEmpty {
+            self.apnsDeviceToken = savedToken
+            self.isPushAuthorized = true
+            self.apnsStatusMessage = "已成功接入 Apple 官方 APNs"
+        }
     }
 
     // MARK: - UIApplicationDelegate Lifecycle
@@ -43,22 +59,27 @@ public final class PushNotificationManager: NSObject, UIApplicationDelegate, UNU
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         let center = UNUserNotificationCenter.current()
-        center.delegate = self
-        requestPushAuthorizationAndRegister()
+        center.delegate = PushNotificationManager.shared
+        PushNotificationManager.shared.requestPushAuthorizationAndRegister()
         return true
     }
 
     public func requestPushAuthorizationAndRegister() {
         let center = UNUserNotificationCenter.current()
-        center.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, error in
+        center.delegate = PushNotificationManager.shared
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
             DispatchQueue.main.async {
-                self?.isPushAuthorized = granted
+                let target = PushNotificationManager.shared
+                target.isPushAuthorized = granted
                 if granted {
+                    if !target.apnsDeviceToken.isEmpty {
+                        target.apnsStatusMessage = "已成功接入 Apple 官方 APNs"
+                    }
                     UIApplication.shared.registerForRemoteNotifications()
                 } else if let error = error {
-                    self?.apnsStatusMessage = "通知权限请求失败: \(error.localizedDescription)"
+                    target.apnsStatusMessage = "通知权限请求异常: \(error.localizedDescription)"
                 } else {
-                    self?.apnsStatusMessage = "请在系统设置中允许通知权限"
+                    target.apnsStatusMessage = "未开启通知权限，请在系统设置中开启"
                 }
             }
         }
@@ -69,10 +90,14 @@ public final class PushNotificationManager: NSObject, UIApplicationDelegate, UNU
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
     ) {
         let tokenHex = deviceToken.map { String(format: "%02x", $0) }.joined()
-        DispatchQueue.main.async { [weak self] in
-            self?.apnsDeviceToken = tokenHex
-            self?.apnsStatusMessage = "已成功接入 Apple 官方 APNs"
-            UserDefaults.standard.set(tokenHex, forKey: "com.smartblanketpro.apns_token")
+        UserDefaults.standard.set(tokenHex, forKey: "com.smartblanketpro.apns_token")
+        DispatchQueue.main.async {
+            let target = PushNotificationManager.shared
+            target.apnsDeviceToken = tokenHex
+            target.isPushAuthorized = true
+            target.apnsStatusMessage = "已成功接入 Apple 官方 APNs"
+            self.apnsDeviceToken = tokenHex
+            self.apnsStatusMessage = "已成功接入 Apple 官方 APNs"
         }
     }
 
@@ -80,8 +105,11 @@ public final class PushNotificationManager: NSObject, UIApplicationDelegate, UNU
         _ application: UIApplication,
         didFailToRegisterForRemoteNotificationsWithError error: Error
     ) {
-        DispatchQueue.main.async { [weak self] in
-            self?.apnsStatusMessage = "APNs 注册提示: \(error.localizedDescription)"
+        DispatchQueue.main.async {
+            let target = PushNotificationManager.shared
+            if target.apnsDeviceToken.isEmpty {
+                target.apnsStatusMessage = "APNs 注册失败: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -99,7 +127,6 @@ public final class PushNotificationManager: NSObject, UIApplicationDelegate, UNU
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
-        // 收到远程静默 APNs (`content-available: 1`) 时，快速点对点查询一次电热毯最新状态后立即释放蓝牙连接
         Task { @MainActor in
             if let active = BlanketBLEManager.shared.activeDevice {
                 await BlanketBLEManager.shared.performQuickBackgroundStatusSync(for: active.id)
@@ -108,20 +135,47 @@ public final class PushNotificationManager: NSObject, UIApplicationDelegate, UNU
         }
     }
 
-    // MARK: - 设备状态更新推送 (Apple 官方 APNs HTTP/2 + 系统通知中心双保险)
-    public func notifyDeviceStateChanged(title: String, body: String, categoryIdentifier: String = "BLANKET_STATUS") {
-        guard enableStatusPushNotifications else { return }
+    // MARK: - 测试推送与实时状态更新推送
+    public func sendTestPushNotification(for device: BlanketDevice) {
+        let title = "✅ 智能电热毯状态推送"
+        let body = "\(device.name) 当前状态：\(device.isOn ? "正在加热" : "待机中") · 左 \(device.gearLeft)挡 (\(device.temperatureLeft)°C) / 右 \(device.gearRight)挡 (\(device.temperatureRight)°C)"
 
-        // 1. 若用户已配置 .p8 密钥且获取了 APNs Device Token，优先通过 Apple 官方 APNs HTTP/2 网关下发远程推送
         if !apnsDeviceToken.isEmpty && !apnsTeamID.isEmpty && !apnsKeyID.isEmpty && !apnsP8PrivateKey.isEmpty {
+            apnsStatusMessage = "正在通过 Apple APNs 云端网关下发..."
             Task {
-                let sentViaAPNs = await sendDirectAppleAPNsPush(title: title, body: body)
-                if !sentViaAPNs {
-                    scheduleSystemNotification(title: title, body: body, delay: 0.1, identifier: UUID().uuidString)
+                let (ok, detail) = await sendDirectAppleAPNsPushWithDetail(title: title, body: body)
+                DispatchQueue.main.async {
+                    self.apnsStatusMessage = detail
+                    if !ok {
+                        self.scheduleSystemNotification(title: title, body: body, delay: 0.1, identifier: UUID().uuidString)
+                    }
                 }
             }
         } else {
-            // 2. 直接通过 iOS 原生 UNUserNotificationCenter 投递系统通知横幅
+            scheduleSystemNotification(title: title, body: body, delay: 0.1, identifier: UUID().uuidString)
+            let timeStr = Date().formatted(date: .omitted, time: .standard)
+            if !apnsDeviceToken.isEmpty {
+                apnsStatusMessage = "已就绪 · 测试通知已于 \(timeStr) 送达"
+            } else {
+                apnsStatusMessage = "本地通知已于 \(timeStr) 送达"
+            }
+        }
+    }
+
+    public func notifyDeviceStateChanged(title: String, body: String, categoryIdentifier: String = "BLANKET_STATUS") {
+        guard enableStatusPushNotifications else { return }
+
+        if !apnsDeviceToken.isEmpty && !apnsTeamID.isEmpty && !apnsKeyID.isEmpty && !apnsP8PrivateKey.isEmpty {
+            Task {
+                let (sentViaAPNs, detail) = await sendDirectAppleAPNsPushWithDetail(title: title, body: body)
+                DispatchQueue.main.async {
+                    self.apnsStatusMessage = detail
+                    if !sentViaAPNs {
+                        self.scheduleSystemNotification(title: title, body: body, delay: 0.1, identifier: UUID().uuidString)
+                    }
+                }
+            }
+        } else {
             scheduleSystemNotification(title: title, body: body, delay: 0.1, identifier: UUID().uuidString)
         }
     }
@@ -166,20 +220,24 @@ public final class PushNotificationManager: NSObject, UIApplicationDelegate, UNU
     }
 
     // MARK: - Apple Official APNs HTTP/2 Direct Push Engine (CryptoKit ES256 JWT)
-    /// 使用 iOS 原生 CryptoKit 签发 ES256 JWT 并直接向 Apple 官方 `api.push.apple.com` 发送 HTTP/2 推送请求
-    public func sendDirectAppleAPNsPush(title: String, body: String) async -> Bool {
-        guard !apnsDeviceToken.isEmpty,
-              let jwt = generateAPNsJWT(teamID: apnsTeamID, keyID: apnsKeyID, p8PEM: apnsP8PrivateKey) else {
-            return false
+    public func sendDirectAppleAPNsPushWithDetail(title: String, body: String) async -> (Bool, String) {
+        guard !apnsDeviceToken.isEmpty else {
+            return (false, "尚未获取到 APNs Device Token")
+        }
+        guard let jwt = generateAPNsJWT(teamID: apnsTeamID, keyID: apnsKeyID, p8PEM: apnsP8PrivateKey) else {
+            return (false, "APNs .p8 私钥格式无效，已回退系统通知")
         }
 
         let host = useSandboxAPNs ? "https://api.sandbox.push.apple.com" : "https://api.push.apple.com"
-        guard let url = URL(string: "\(host)/3/device/\(apnsDeviceToken)") else { return false }
+        guard let url = URL(string: "\(host)/3/device/\(apnsDeviceToken)") else {
+            return (false, "APNs URL 无效")
+        }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("bearer \(jwt)", forHTTPHeaderField: "authorization")
-        request.setValue("com.jinghe.smartblanket.pro", forHTTPHeaderField: "apns-topic")
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.jinghe.smartblanket.pro"
+        request.setValue(bundleID, forHTTPHeaderField: "apns-topic")
         request.setValue("alert", forHTTPHeaderField: "apns-push-type")
         request.setValue("10", forHTTPHeaderField: "apns-priority")
 
@@ -194,18 +252,25 @@ public final class PushNotificationManager: NSObject, UIApplicationDelegate, UNU
             ]
         ]
 
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: payload) else { return false }
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: payload) else {
+            return (false, "JSON 编码失败")
+        }
         request.httpBody = bodyData
 
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            if let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 200 {
-                return true
+            let (respData, response) = try await URLSession.shared.data(for: request)
+            if let httpResp = response as? HTTPURLResponse {
+                if httpResp.statusCode == 200 {
+                    return (true, "Apple 官方 APNs 云端直推成功 (HTTP 200)")
+                } else {
+                    let reason = String(data: respData, encoding: .utf8) ?? "HTTP \(httpResp.statusCode)"
+                    return (false, "APNs 返回 \(httpResp.statusCode): \(reason)")
+                }
             }
         } catch {
-            return false
+            return (false, "APNs 网络异常: \(error.localizedDescription)")
         }
-        return false
+        return (false, "APNs 未知响应")
     }
 
     private func generateAPNsJWT(teamID: String, keyID: String, p8PEM: String) -> String? {

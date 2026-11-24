@@ -2,9 +2,8 @@ import SwiftUI
 import UIKit
 
 /// 状态与开启时长统计中心 (`RuntimeStatusView`)
-/// 满足 Requirement 3 & Requirement 5：
-/// - 实时查看本次已经开启了多少小时/分钟、历史累计运行总小时数、累计开机次数、定时关机/预约开机剩余倒计时、蓝牙直连耗时与信号强度
-/// - 新增「切入后台自动断开蓝牙」开关与「Apple 官方 APNs 状态推送」配置面板（适配带推送权限的自签证书）
+/// 修复顶部两个大卡片边缘阴影被 List Section 裁切的问题：
+/// - 采用 iOS 26 原生 `.listSectionMargins(.horizontal, 0)` 将顶部 Section 扩展至全屏宽，内部设置 `.padding(.horizontal, 20)` 与 `.padding(.vertical, 16)`，既与下方 Section 严格对齐，又保留完整 20pt 阴影渲染区
 public struct RuntimeStatusView: View {
     @ObservedObject var bleManager: BlanketBLEManager
     @ObservedObject private var pushManager = PushNotificationManager.shared
@@ -46,7 +45,7 @@ public struct RuntimeStatusView: View {
 
     public var body: some View {
         List {
-            // MARK: 1. 顶部双联 Liquid Glass 开启时长统计舱 (GlassEffectContainer)
+            // MARK: 1. 顶部双联 Liquid Glass 开启时长统计舱（全宽 Section 不裁切阴影 + 20pt 内边距与下方严格对齐）
             Section {
                 GlassEffectContainer(spacing: 6) {
                     HStack(spacing: 14) {
@@ -93,10 +92,11 @@ public struct RuntimeStatusView: View {
                         .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
                         .glassEffectID("totalHours", in: statusGlassNamespace)
                     }
-                    .padding(12)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 16)
                 }
-                .padding(.horizontal, -12)
             }
+            .listSectionMargins(.horizontal, 0)
             .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
@@ -173,7 +173,7 @@ public struct RuntimeStatusView: View {
                 } header: {
                     Text("点对点连接缓存与后台断连策略")
                 } footer: {
-                    Text("已启用三级连接缓存（外设实例 + 特征值句柄 + 8字节 DES 密钥缓存），点击控制时无需扫描即可点对点直连；App 切入后台时自动断开蓝牙并预埋硬件定时通知，重回前台或收到推送唤醒时 0.15 秒极速同步最新状态。")
+                    Text("前台打开 App 时自动保持连接并实时接收电热毯物理按键状态更新；App 切入后台时自动断开蓝牙并预埋硬件定时通知，重回前台时 0.15 秒命中连接缓存极速同步最新状态。")
                 }
             }
 
@@ -186,7 +186,7 @@ public struct RuntimeStatusView: View {
                 )
 
                 LabeledContent("APNs 注册状态") {
-                    Text(pushManager.apnsStatusMessage)
+                    Text(pushManager.effectiveStatusText)
                         .font(.caption)
                         .foregroundStyle(pushManager.apnsDeviceToken.isEmpty ? Color.secondary : Color.green)
                 }
@@ -241,10 +241,7 @@ public struct RuntimeStatusView: View {
                     Toggle("使用 Sandbox 沙盒网关 (开发证书)", isOn: $pushManager.useSandboxAPNs)
 
                     Button {
-                        pushManager.notifyDeviceStateChanged(
-                            title: "✅ 智能电热毯 APNs 推送测试",
-                            body: "\(device.name) 当前状态：\(device.isOn ? "正在加热" : "待机中") · 左 \(device.gearLeft)挡 / 右 \(device.gearRight)挡"
-                        )
+                        pushManager.sendTestPushNotification(for: device)
                     } label: {
                         Label("发送一条 APNs 状态测试推送", systemImage: "paperplane.fill")
                     }
