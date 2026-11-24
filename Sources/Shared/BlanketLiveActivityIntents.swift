@@ -3,7 +3,6 @@ import AppIntents
 import ActivityKit
 
 /// 灵动岛与实时活动卡片专用交互指令：快捷开关电源
-/// 同时由主 App 与 Widget Extension 共享编译；在灵动岛或锁屏卡片点击时直接唤醒主 App 后台执行低功耗蓝牙控制并同步实时活动状态
 public struct BlanketLiveTogglePowerIntent: LiveActivityIntent {
     public static var title: LocalizedStringResource = "灵动岛快捷开关电热毯"
     public static var description = IntentDescription("在灵动岛或实时活动卡片中直接开启或关闭电热毯。")
@@ -32,7 +31,6 @@ public struct BlanketLiveTogglePowerIntent: LiveActivityIntent {
         if let updated = BlanketBLEManager.shared.devices.first(where: { $0.id == targetUUID }) {
             await LiveActivityManager.shared.syncActivityState(for: updated)
         }
-        // 后台交互完成后短暂等待发包完成即刻断开蓝牙以极致省电
         try? await Task.sleep(nanoseconds: 450_000_000)
         if BlanketBLEManager.shared.disconnectWhenEnteringBackground {
             BlanketBLEManager.shared.disconnect(deviceID: targetUUID)

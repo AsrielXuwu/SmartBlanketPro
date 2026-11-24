@@ -3,7 +3,6 @@ import ActivityKit
 import SwiftUI
 
 /// 电热毯灵动岛与实时活动共享数据模型 (`ActivityAttributes`)
-/// 同时被主 App (`SmartBlanketPro`) 与实时活动扩展 (`SmartBlanketProWidget`) 编译引用
 public struct BlanketActivityAttributes: ActivityAttributes {
     public struct ContentState: Codable, Hashable, Sendable {
         public var isOn: Bool

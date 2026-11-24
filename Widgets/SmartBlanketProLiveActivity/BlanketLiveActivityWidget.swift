@@ -3,22 +3,17 @@ import AppIntents
 import SwiftUI
 import WidgetKit
 
-/// iOS 26 / iOS 27 原生灵动岛与液态玻璃实时活动组件 (`BlanketLiveActivityWidget`)
-/// 严格遵循 Apple《Live Activities》Human Interface Guidelines：
-/// - 锁屏与通知中心实时活动卡片采用 iOS 26/27 原生液态玻璃质感 (`.glassEffect`) 与动态挡位色系（1-2蓝 / 3-5绿 / 6-8橙 / 9或除螨红）
-/// - 内置滚轮式三格垂直挡位调节视窗与快捷电源开关 (`LiveActivityIntent`)，无需打开 App 即可在灵动岛或锁屏实时控制
-/// - 计时器全部采用系统级 `Text(timerInterval:)` 与 `Text(date, style: .relative)` 渲染，App 后台零唤醒、极度省电
+/// iOS 26 / iOS 27 原生灵动岛与通知中心液态玻璃实时活动组件 (`BlanketLiveActivityWidget`)
 public struct BlanketLiveActivityWidget: Widget {
     public init() {}
 
     public var body: some WidgetConfiguration {
         ActivityConfiguration(for: BlanketActivityAttributes.self) { context in
-            // MARK: - 锁屏 / 通知中心 iOS 26/27 液态玻璃实时活动卡片
+            // 通知中心 / 锁屏：采用 iOS 26/27 原生液态玻璃背景 (.glassEffect)，其余交互与状态元素与灵动岛保持一致
             lockScreenLiquidGlassBanner(context: context)
                 .activityBackgroundTint(.clear)
                 .activitySystemActionForegroundColor(context.state.isOn ? context.state.themeColor : .primary)
         } dynamicIsland: { context in
-            // MARK: - 灵动岛 (Dynamic Island) 展开态、紧凑态与最小化态
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
                     HStack(spacing: 8) {
@@ -127,24 +122,21 @@ public struct BlanketLiveActivityWidget: Widget {
                         .foregroundStyle(.secondary)
                 }
             } minimal: {
-                ZStack {
-                    Image(systemName: context.state.isOn ? (context.state.isMiteRemoval ? "sparkles" : "flame.fill") : "power")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(context.state.isOn ? context.state.themeColor : .secondary)
-                }
+                Image(systemName: context.state.isOn ? (context.state.isMiteRemoval ? "sparkles" : "flame.fill") : "power")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(context.state.isOn ? context.state.themeColor : .secondary)
             }
             .keylineTint(context.state.isOn ? context.state.themeColor : .secondary)
         }
     }
 
-    // MARK: - 锁屏实时活动 iOS 26/27 液态玻璃卡片
+    // MARK: - 锁屏 / 通知中心 iOS 26/27 液态玻璃实时活动卡片
     @ViewBuilder
     private func lockScreenLiquidGlassBanner(context: ActivityViewContext<BlanketActivityAttributes>) -> some View {
         let state = context.state
         let deviceID = context.attributes.deviceID
 
         VStack(spacing: 12) {
-            // 1. 顶部状态栏：设备名 + 模式 + 零功耗计时 + 快捷开关按钮
             HStack(spacing: 10) {
                 ZStack {
                     Circle()
@@ -200,7 +192,6 @@ public struct BlanketLiveActivityWidget: Widget {
 
                 Spacer(minLength: 4)
 
-                // 快捷电源开关按钮
                 Button(intent: BlanketLiveTogglePowerIntent(deviceID: deviceID)) {
                     HStack(spacing: 4) {
                         Image(systemName: "power")
@@ -219,7 +210,6 @@ public struct BlanketLiveActivityWidget: Widget {
                 .buttonStyle(.plain)
             }
 
-            // 2. 仿滚轮式双温区快捷调挡视窗
             if state.syncDualZones {
                 wheelPickerStyleZoneControl(
                     deviceID: deviceID,
@@ -263,7 +253,6 @@ public struct BlanketLiveActivityWidget: Widget {
         )
     }
 
-    // MARK: - 锁屏液态玻璃卡片：三格垂直滚轮视窗 + 上下/增减调挡控件
     @ViewBuilder
     private func wheelPickerStyleZoneControl(
         deviceID: String,
@@ -288,7 +277,6 @@ public struct BlanketLiveActivityWidget: Widget {
 
             Spacer(minLength: 2)
 
-            // 仿滚轮 3 格垂直刻度预览（上格 gear-1 / 中格 current / 下格 gear+1）
             VStack(spacing: 0) {
                 Text(gear > 1 ? "\(gear - 1)" : " ")
                     .font(.system(size: 10, weight: .medium, design: .rounded).monospacedDigit())
@@ -309,7 +297,6 @@ public struct BlanketLiveActivityWidget: Widget {
             .padding(.vertical, 3)
             .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-            // 垂直滚轮上下步进按钮（下调 / 上调）
             VStack(spacing: 4) {
                 Button(intent: BlanketLiveStepGearIntent(deviceID: deviceID, zone: zone, delta: 1)) {
                     Image(systemName: "chevron.up")
@@ -336,7 +323,6 @@ public struct BlanketLiveActivityWidget: Widget {
         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
-    // MARK: - 灵动岛展开态：紧凑滚轮调挡条
     @ViewBuilder
     private func expandedWheelStepperBar(
         deviceID: String,

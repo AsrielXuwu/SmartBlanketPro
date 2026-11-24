@@ -2,9 +2,10 @@ import SwiftUI
 
 /// 温控中心主视图 (`DeviceControlView`)
 /// 严格遵循 Apple iOS 26 / iOS 27 Liquid Glass 设计规范：
-/// 1. 顶部预约开机状态胶囊按钮永远仅作为预约开机按钮卡片（不再显示自动关机剩余时间），点击原位无缝展开拨轮小菜单 (Requirement 3)；
-/// 2. 底部三个悬浮控制按钮（开关机、除螨模式、双温区同步）尺寸与左右间距完全一致对齐（展开态等宽等高胶囊，收起态等大纯图标圆形）(Requirement 4)；
-/// 3. 嵌入 `MainTabView` 统一 `NavigationStack`，支持三页左右滑动无缝切换与顶栏按钮无缝过渡动画 (Requirement 5)。
+/// 1. 修复上滑收起悬浮按钮时的白底闪烁与滚动卡顿：使用 `.overlay(alignment: .bottom)` + 单一持久化 `Button` 视图标识（绝不在滚动中销毁重建 `_UIGlassEffect` 视图或动态改动 `List` 的 `safeAreaInsets`）
+/// 2. 挡位色彩严格遵循：1~2 挡蓝色 (`.blue`)、3~5 挡绿色 (`.green`)、6~8 挡橙色 (`.orange`)、9 挡与除螨模式红色 (`.red`)，关闭状态 (`!device.isOn`) 无背景着色；待机图标采用区分鲜明的 Apple HIG 语义冷色系
+/// 3. 点击顶部预约开机状态胶囊按钮时，从该按钮原位通过 `.popover` + `.presentationCompactAdaptation(.popover)` 无缝展开拨轮小菜单设置预约开机时间
+/// 4. 移除底部「定时关机与预约开机」下方的横向预设时间按钮排
 public struct DeviceControlView: View {
     @ObservedObject var bleManager: BlanketBLEManager
     let deviceID: UUID
@@ -12,9 +13,11 @@ public struct DeviceControlView: View {
     @Namespace private var glassMorphNamespace
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var currentTime = Date()
+    @State private var showingScannerSheet = false
     @State private var isFloatingDockCollapsed = false
     @State private var showingScheduleOnPopover = false
 
+    /// 15 秒低频时钟刷新（仅用于更新分钟级已开启时长文案，彻底消除每秒触发 List 重排导致的滚动掉帧）
     private let clockTimer = Timer.publish(every: 15.0, on: .main, in: .common).autoconnect()
 
     public init(bleManager: BlanketBLEManager, deviceID: UUID) {
@@ -153,7 +156,7 @@ public struct DeviceControlView: View {
                      : "切换「双温区同步调节」时，上方液态玻璃温区舱将自动融合或分离。")
             }
 
-            // MARK: 4. 定时关机与预约定时开机原生拨轮 Section
+            // MARK: 4. 定时关机与预约定时开机原生拨轮 Section（已移除底部横向时间选择按钮排）
             Section {
                 HStack(spacing: 12) {
                     // 左拨轮：自动关机定时 (1~12 小时)
@@ -250,7 +253,7 @@ public struct DeviceControlView: View {
                 Text(device.isOn ? device.formattedRemainingCloseTime : device.formattedRemainingOpenTime)
             }
 
-            // MARK: 5. 实时开启小时数与连接快照 Section
+            // MARK: 5. 实时开启小时数与连接快照 Section (Requirement 5)
             Section("当前运行状态摘要") {
                 LabeledContent("当前状态") {
                     Text(device.isOn ? "正在加热 · \(device.mode.title)" : "已关机待机")
@@ -285,10 +288,10 @@ public struct DeviceControlView: View {
                 }
             }
 
-            // 底部留白缓冲：为悬浮控制坞 + 悬浮 Tab 栏预留完整滚动空间
+            // 底部留白缓冲：确保最后一组卡片可滚出底部悬浮控制坞上方，且无需动态修改 List 的 safeAreaInsets
             Section {
                 Color.clear
-                    .frame(height: 118)
+                    .frame(height: 68)
             }
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
@@ -315,7 +318,53 @@ public struct DeviceControlView: View {
         }
         .overlay(alignment: .bottom) {
             floatingLiquidGlassBottomDock
-                .padding(.bottom, 64)
+        }
+        .navigationTitle(device.name)
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            if bleManager.devices.count > 1 {
+                ToolbarItem(placement: .topBarLeading) {
+                    Menu {
+                        ForEach(bleManager.devices) { item in
+                            Button {
+                                bleManager.activeDeviceID = item.id
+                            } label: {
+                                Label(
+                                    "\(item.name) (\(item.roomName))",
+                                    systemImage: item.id == device.id ? "checkmark.circle.fill" : "bed.double"
+                                )
+                            }
+                        }
+                    } label: {
+                        Label(device.roomName, systemImage: "chevron.up.chevron.down")
+                    }
+                }
+            }
+
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    Task { @MainActor in
+                        await bleManager.queryStatus(for: deviceID)
+                    }
+                } label: {
+                    Label("同步状态", systemImage: "arrow.clockwise")
+                }
+            }
+
+            ToolbarSpacer(.fixed)
+
+            ToolbarItem(placement: .secondaryAction) {
+                Button {
+                    showingScannerSheet = true
+                } label: {
+                    Label("扫描新设备", systemImage: "plus")
+                }
+            }
+        }
+        .sheet(isPresented: $showingScannerSheet) {
+            ScannerSheetView(bleManager: bleManager)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
         }
         .task(id: deviceID) {
             bleManager.activeDeviceID = deviceID
@@ -326,13 +375,13 @@ public struct DeviceControlView: View {
         }
     }
 
-    // MARK: - 顶部双温区拨轮卡片 + 顶部快捷关机定时大卡片 + 独立无粘连状态胶囊
+    // MARK: - 顶部双温区拨轮卡片 + 顶部快捷关机定时大卡片 + 独立无粘连状态胶囊（支持点击预约状态原位展开拨轮小菜单）
     private var liquidGlassMorphingHeroHeader: some View {
         let leftTint = LiquidGlassTheme.activeGlassBackgroundTint(isOn: device.isOn, mode: device.mode, gear: device.gearLeft)
         let rightTint = LiquidGlassTheme.activeGlassBackgroundTint(isOn: device.isOn, mode: device.mode, gear: device.gearRight)
 
         return VStack(spacing: 0) {
-            // 1. 左右温区拨轮大卡片
+            // 1. 左右温区拨轮大卡片（关闭时无背景色，开启时按 1-2蓝/3-5绿/6-8橙/9或除螨红 动态着色）
             GlassEffectContainer(spacing: 6) {
                 Group {
                     if device.syncDualZones {
@@ -393,7 +442,7 @@ public struct DeviceControlView: View {
                 .padding(.horizontal, 20)
                 .padding(.bottom, 14)
 
-            // 3. 待机/已开启状态胶囊 + 纯粹的预约开机按钮胶囊 (Requirement 3: 不再显示自动关机剩余时间)
+            // 3. 待机/已开启状态胶囊 + 可点击展开预约开机拨轮小菜单的预约状态胶囊 (Requirement 4)
             HStack(spacing: 14) {
                 HStack(spacing: 6) {
                     Image(systemName: device.isOn ? "flame.fill" : "moon.zzz.fill")
@@ -416,7 +465,7 @@ public struct DeviceControlView: View {
                     in: .capsule
                 )
 
-                // 预约开机按钮卡片：永远只作为预约开机按钮，点击原位展开拨轮小菜单
+                // 点击此预约开机状态按钮，从该按钮原位无缝展开拨轮小菜单 (Requirement 4)
                 Button {
                     showingScheduleOnPopover = true
                 } label: {
@@ -464,7 +513,7 @@ public struct DeviceControlView: View {
         }
     }
 
-    // MARK: - 从顶部预约开机胶囊原位无缝展开的拨轮小菜单
+    // MARK: - 从顶部预约开机胶囊原位无缝展开的拨轮小菜单 (Requirement 4)
     private var scheduleOnWheelPopoverMenu: some View {
         VStack(spacing: 8) {
             HStack {
@@ -523,7 +572,7 @@ public struct DeviceControlView: View {
         .frame(width: 256)
     }
 
-    // MARK: - 单温区液态玻璃卡片
+    // MARK: - 单温区液态玻璃卡片（右上角显示温度 °C，中央为原生拨轮滚动调节挡位）
     private func singleZoneGlassOrb(
         title: String,
         iconRole: LiquidGlassTheme.SemanticIconRole,
@@ -710,6 +759,7 @@ public struct DeviceControlView: View {
                             .tint(dominantGearColor)
                             .controlSize(.small)
                         } else {
+                            // 关闭状态下不填充彩色背景色，仅高亮文字与图标
                             Button {
                                 Task { @MainActor in
                                     await bleManager.setAutoOffHours(hours, for: deviceID)
@@ -740,7 +790,7 @@ public struct DeviceControlView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // MARK: - 原生温区滑块与快捷步进控件
+    // MARK: - 原生温区滑块与快捷步进控件 (1-2蓝 / 3-5绿 / 6-8橙 / 9或除螨红；关闭时按钮无背景色)
     private func nativeZoneGearRow(
         title: String,
         symbol: String,
@@ -808,6 +858,7 @@ public struct DeviceControlView: View {
                 .disabled(gear >= 9)
             }
 
+            // 1 / 3 / 5 / 7 / 9 常用挡位原生 Glass 快捷点选行（每个挡位展示对应蓝/绿/橙/红色彩，关闭时无背景色）
             GlassEffectContainer(spacing: 8) {
                 HStack(spacing: 8) {
                     ForEach([1, 3, 5, 7, 9], id: \.self) { step in
@@ -849,15 +900,17 @@ public struct DeviceControlView: View {
         .padding(.vertical, 6)
     }
 
-    // MARK: - 底部悬浮 Liquid Glass 快捷控制坞 (Requirement 4: 三个按钮尺寸、形状、左右间距 100% 一致对齐)
+    // MARK: - 底部悬浮 Liquid Glass 快捷控制坞
+    /// 【修复白底闪烁与掉帧】：保持每个按钮为单一持久化 View 实例（绝不用 if/else 分支销毁重建 _UIGlassEffect 视图），
+    /// 仅在同一按钮内部平滑收起文字，因此底层液态玻璃材质层始终常驻，0 白闪、120Hz 满帧丝滑过渡！
     private var floatingLiquidGlassBottomDock: some View {
         GlassEffectContainer(spacing: 12) {
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 if isFloatingDockCollapsed {
                     Spacer(minLength: 0)
                 }
 
-                // 1. 开关电热毯按钮（与另外两个按钮完全等尺寸、等间距）
+                // 1. 开关电热毯悬浮按钮（单一持久化视图，关闭时无彩色背景，开启时按当前挡位/模式显色）
                 Button {
                     Task { @MainActor in
                         await bleManager.setPower(isOn: !device.isOn, for: deviceID)
@@ -865,21 +918,18 @@ public struct DeviceControlView: View {
                 } label: {
                     HStack(spacing: isFloatingDockCollapsed ? 0 : 6) {
                         Image(systemName: "power")
-                            .font(.subheadline.weight(.bold))
+                            .font(.title3.weight(.semibold))
                             .foregroundStyle(device.isOn ? Color.white : Color.primary)
                         if !isFloatingDockCollapsed {
-                            Text(device.isOn ? "关闭" : "开启")
+                            Text(device.isOn ? "关闭电热毯" : "开启电热毯")
                                 .font(.subheadline.weight(.semibold))
                                 .foregroundStyle(device.isOn ? Color.white : Color.primary)
                                 .lineLimit(1)
                         }
                     }
-                    .frame(
-                        minWidth: isFloatingDockCollapsed ? 46 : 0,
-                        maxWidth: isFloatingDockCollapsed ? 46 : .infinity,
-                        minHeight: 46,
-                        maxHeight: 46
-                    )
+                    .frame(maxWidth: isFloatingDockCollapsed ? nil : .infinity)
+                    .padding(.vertical, isFloatingDockCollapsed ? 6 : 4)
+                    .padding(.horizontal, isFloatingDockCollapsed ? 6 : 8)
                 }
                 .buttonStyle(.glassProminent)
                 .buttonBorderShape(.capsule)
@@ -887,7 +937,7 @@ public struct DeviceControlView: View {
                 .sensoryFeedback(.impact(weight: .heavy), trigger: device.isOn)
                 .accessibilityLabel(device.isOn ? "关闭电热毯" : "开启电热毯")
 
-                // 2. 切换除螨模式按钮（与开关、同步按钮完全等尺寸、等间距）
+                // 2. 切换除螨模式悬浮按钮（单一持久化视图，除螨开启时为红色，关闭时无背景色）
                 Button {
                     let nextMode: BlanketHeatingMode = (device.mode == .miteRemoval) ? .normal : .miteRemoval
                     Task { @MainActor in
@@ -896,65 +946,56 @@ public struct DeviceControlView: View {
                 } label: {
                     HStack(spacing: isFloatingDockCollapsed ? 0 : 6) {
                         Image(systemName: "sparkles")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle((device.isOn && device.mode == .miteRemoval) ? Color.red : Color.primary)
+                            .font(.title3)
+                            .foregroundStyle(
+                                (device.isOn && device.mode == .miteRemoval)
+                                    ? Color.red
+                                    : Color.primary
+                            )
                         if !isFloatingDockCollapsed {
                             Text(device.mode == .miteRemoval ? "除螨中" : "除螨")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle((device.isOn && device.mode == .miteRemoval) ? Color.red : Color.primary)
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(
+                                    (device.isOn && device.mode == .miteRemoval)
+                                        ? Color.red
+                                        : Color.primary
+                                )
                                 .lineLimit(1)
                         }
                     }
-                    .frame(
-                        minWidth: isFloatingDockCollapsed ? 46 : 0,
-                        maxWidth: isFloatingDockCollapsed ? 46 : .infinity,
-                        minHeight: 46,
-                        maxHeight: 46
-                    )
+                    .padding(.vertical, isFloatingDockCollapsed ? 6 : 4)
+                    .padding(.horizontal, isFloatingDockCollapsed ? 6 : 8)
                 }
                 .buttonStyle(.glass)
                 .buttonBorderShape(.capsule)
                 .tint((device.isOn && device.mode == .miteRemoval) ? Color.red : Color.primary)
                 .accessibilityLabel("切换除螨模式")
 
-                // 3. 切换双温区同步按钮（尺寸、形状、左右间距与旁边两个按钮完全一致！）
+                // 3. 一键切换双区同步液态玻璃圆钮
                 Button {
                     withAnimation(morphAnimation) {
                         let current = device.syncDualZones
                         bleManager.binding(for: deviceID, keyPath: \.syncDualZones, default: false).wrappedValue = !current
                     }
                 } label: {
-                    HStack(spacing: isFloatingDockCollapsed ? 0 : 6) {
-                        Image(systemName: device.syncDualZones ? "link.circle.fill" : "rectangle.split.2x1")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(
-                                LiquidGlassTheme.iconColor(
-                                    for: .dualZone,
-                                    isOn: device.isOn,
-                                    mode: device.mode,
-                                    gear: device.gearLeft
-                                )
+                    Image(systemName: device.syncDualZones ? "link.circle.fill" : "rectangle.split.2x1")
+                        .font(.title3)
+                        .foregroundStyle(
+                            LiquidGlassTheme.iconColor(
+                                for: .dualZone,
+                                isOn: device.isOn,
+                                mode: device.mode,
+                                gear: device.gearLeft
                             )
-                        if !isFloatingDockCollapsed {
-                            Text(device.syncDualZones ? "已同步" : "同步")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                        }
-                    }
-                    .frame(
-                        minWidth: isFloatingDockCollapsed ? 46 : 0,
-                        maxWidth: isFloatingDockCollapsed ? 46 : .infinity,
-                        minHeight: 46,
-                        maxHeight: 46
-                    )
+                        )
+                        .padding(isFloatingDockCollapsed ? 6 : 4)
                 }
                 .buttonStyle(.glass)
-                .buttonBorderShape(.capsule)
+                .buttonBorderShape(.circle)
                 .accessibilityLabel("切换双温区同步")
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 4)
+            .padding(.horizontal, 16)
+            .padding(.top, 6)
             .padding(.bottom, 8)
         }
     }
