@@ -305,14 +305,20 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
     }
 
     private func loadDevicesFromDisk() {
-        let loaded = Self.loadSavedDevicesSnapshot()
+        var loaded = Self.loadSavedDevicesSnapshot()
+        for i in loaded.indices {
+            // 彻底退出 App 后重新冷启动时，默认重置为待机状态与普通加热模式（保留记忆挡位与定时配置）；
+            // 待连接上电热毯并收到完整状态查询回包后，再根据硬件真实状态实时同步开关机、模式、挡位与定时
+            loaded[i].isOn = false
+            loaded[i].mode = .normal
+            loaded[i].remainingTimeCloseSec = 0
+            loaded[i].autoOffTargetDate = nil
+            loaded[i].currentSessionStartDate = nil
+        }
         self.devices = loaded
         self.activeDeviceID = loaded.first?.id
         for dev in loaded {
             lastNotifiedStates[dev.id] = (dev.isOn, dev.gearLeft, dev.gearRight, dev.mode, dev.timeCloseHours)
-            if dev.isOn {
-                lastGearAccountingDates[dev.id] = Date()
-            }
         }
     }
 
@@ -1162,30 +1168,55 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             return
         }
         let pid = deviceProductIDs[deviceID]
-        let primaryQueryCmd = BlanketProtocol.queryCommand(forProductId: pid)
+        // 冷启动通过 retrievePeripherals 直连时可能尚未扫描到广播包 productId，优先发送 8 属性全状态查询 + 5 属性核心查询双保险
+        let primaryQueryCmd = (pid != nil) ? BlanketProtocol.queryCommand(forProductId: pid) : BlanketProtocol.queryAllStatusCmd
         let syncBefore = lastBLEProcessedSyncDates[deviceID]
 
         if let cipherData = BlanketProtocol.encryptPayload(cmdHex: primaryQueryCmd, secretKey: resolvedKeys.active) {
             writeCipherDataOnBLEQueue(cipherData, to: peripheral, characteristic: characteristic, deviceID: deviceID)
         }
 
-        bleQueue.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+        // 第一级兜底 (0.28s)：若尚未收到回包，尝试核心 5 属性查询（000400050152979899）
+        bleQueue.asyncAfter(deadline: .now() + 0.28) { [weak self] in
             guard let self = self,
                   self.bleConnectionPhases[deviceID] == .connected,
+                  self.lastBLEProcessedSyncDates[deviceID] == syncBefore,
                   let p = self.activePeripherals[deviceID],
                   p.state == .connected,
                   let c = self.controlCharacteristics[deviceID],
                   let keys = self.resolveActiveSecretKeyOnBLEQueue(for: deviceID) else { return }
 
-            if self.lastBLEProcessedSyncDates[deviceID] == syncBefore {
-                if primaryQueryCmd != BlanketProtocol.queryCoreStatusCmd {
-                    if let fallbackCipher = BlanketProtocol.encryptPayload(cmdHex: BlanketProtocol.queryCoreStatusCmd, secretKey: keys.active) {
-                        self.writeCipherDataOnBLEQueue(fallbackCipher, to: p, characteristic: c, deviceID: deviceID)
-                    }
-                } else if self.verifiedWorkingKeys[deviceID] == nil {
-                    if let altCipher = BlanketProtocol.encryptPayload(cmdHex: BlanketProtocol.queryCoreStatusCmd, secretKey: keys.alt) {
-                        self.writeCipherDataOnBLEQueue(altCipher, to: p, characteristic: c, deviceID: deviceID)
-                    }
+            let secondCmd = (primaryQueryCmd == BlanketProtocol.queryCoreStatusCmd)
+                ? BlanketProtocol.queryAllStatusCmd
+                : BlanketProtocol.queryCoreStatusCmd
+            if let cipher = BlanketProtocol.encryptPayload(cmdHex: secondCmd, secretKey: keys.active) {
+                self.writeCipherDataOnBLEQueue(cipher, to: p, characteristic: c, deviceID: deviceID)
+            }
+        }
+
+        // 第二级兜底 (0.58s)：若冷启动直连未经过广播包且正序/反序密钥尚未锁定，自动用备用字节序密钥 (alt) 发送全状态与核心查询
+        bleQueue.asyncAfter(deadline: .now() + 0.58) { [weak self] in
+            guard let self = self,
+                  self.bleConnectionPhases[deviceID] == .connected,
+                  self.lastBLEProcessedSyncDates[deviceID] == syncBefore,
+                  self.verifiedWorkingKeys[deviceID] == nil,
+                  let p = self.activePeripherals[deviceID],
+                  p.state == .connected,
+                  let c = self.controlCharacteristics[deviceID],
+                  let keys = self.resolveActiveSecretKeyOnBLEQueue(for: deviceID) else { return }
+
+            if let altAllCipher = BlanketProtocol.encryptPayload(cmdHex: BlanketProtocol.queryAllStatusCmd, secretKey: keys.alt) {
+                self.writeCipherDataOnBLEQueue(altAllCipher, to: p, characteristic: c, deviceID: deviceID)
+            }
+            self.bleQueue.asyncAfter(deadline: .now() + 0.22) { [weak self] in
+                guard let self = self,
+                      self.bleConnectionPhases[deviceID] == .connected,
+                      self.lastBLEProcessedSyncDates[deviceID] == syncBefore,
+                      let p2 = self.activePeripherals[deviceID],
+                      p2.state == .connected,
+                      let c2 = self.controlCharacteristics[deviceID] else { return }
+                if let altCoreCipher = BlanketProtocol.encryptPayload(cmdHex: BlanketProtocol.queryCoreStatusCmd, secretKey: keys.alt) {
+                    self.writeCipherDataOnBLEQueue(altCoreCipher, to: p2, characteristic: c2, deviceID: deviceID)
                 }
             }
         }
@@ -1253,7 +1284,8 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
 
         if isFirstHandshake {
-            bleQueue.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            let handshakeSyncSnapshot = lastBLEProcessedSyncDates[deviceID]
+            bleQueue.asyncAfter(deadline: .now() + 0.08) { [weak self] in
                 guard let self = self else { return }
                 if let queued = self.pendingCommandsAfterConnect.removeValue(forKey: deviceID), !queued.isEmpty {
                     Task.detached(priority: .userInitiated) { [weak self] in
@@ -1262,13 +1294,17 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                             try? await Task.sleep(nanoseconds: 180_000_000)
                         }
                     }
-                }
-                if let lastWrite = self.commandWriteStartTimes[deviceID],
-                   Date().timeIntervalSince(lastWrite) < 0.25 {
                     self.scheduleDelayedQueryOnBLEQueue(for: deviceID, delaySeconds: 0.5)
                 } else {
                     self.sendQueryOnBLEQueue(for: deviceID)
                 }
+            }
+            // 冷启动首次连接双保险：若 1.0 秒内因蓝牙链路刚建立丢包尚未收到状态回包，自动补发一次完整状态查询
+            bleQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self = self,
+                      self.bleConnectionPhases[deviceID] == .connected,
+                      self.lastBLEProcessedSyncDates[deviceID] == handshakeSyncSnapshot else { return }
+                self.sendQueryOnBLEQueue(for: deviceID)
             }
         }
     }
@@ -1378,9 +1414,22 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                 finalizeUsageSession(for: deviceID, endDate: now)
                 draft = devices[idx]
                 draft.isOn = false
+                draft.remainingTimeCloseSec = 0
+                draft.autoOffTargetDate = nil
                 stateChanged = true
                 timerChanged = true
                 liveActivityRelevantChanged = true
+            } else if !isOn {
+                if draft.isOn || draft.remainingTimeCloseSec != 0 || draft.autoOffTargetDate != nil || draft.mode != .normal {
+                    draft.isOn = false
+                    draft.mode = .normal
+                    draft.remainingTimeCloseSec = 0
+                    draft.autoOffTargetDate = nil
+                    draft.currentSessionStartDate = nil
+                    stateChanged = true
+                    timerChanged = true
+                    liveActivityRelevantChanged = true
+                }
             } else if draft.isOn != isOn {
                 draft.isOn = isOn
                 stateChanged = true
