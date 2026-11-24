@@ -3,7 +3,8 @@ import SwiftUI
 /// 温控中心主视图 (`DeviceControlView`)
 /// 100% 严格采用 iOS 26 / iOS 27 原生控件与官方 Liquid Glass API：
 /// - 零自定义背景色、零伪造 `.regularMaterial` 卡片，完全由系统 `List` 与 Scroll Edge 折射引擎接管
-/// - 顶部采用 `GlassEffectContainer(spacing: 16)` + `@Namespace` + `.glassEffectID(_:in:)` 实现左右温区玻璃舱在「独立调温」与「双区同步」之间的物理级流体合并/分离形变（Morphing）
+/// - 顶部采用 `GlassEffectContainer(spacing: 6)` + `@Namespace` + `.glassEffectID(_:in:)` 仅包裹左右温区玻璃舱，实现在「独立调温」与「双区同步」之间的物理级流体合并/分离形变（Morphing），同时预留充足内边距防止边缘阴影被截断
+/// - 下方待机/已开启状态与预约/定时状态胶囊移出 `GlassEffectContainer` 独立布局并拉大间距，彻底消除玻璃粘连效应
 /// - 底部悬浮控制栏（`.safeAreaInset(edge: .bottom)`）采用 `GlassEffectContainer` + `.buttonStyle(.glassProminent)` / `.buttonStyle(.glass)`
 /// - 挡位调节采用原生 `Slider(value:in: 1...9, step: 1)`（在 iOS 26/27 SDK 下拖动自动呈现官方液态水滴透镜）
 public struct DeviceControlView: View {
@@ -51,11 +52,11 @@ public struct DeviceControlView: View {
 
     public var body: some View {
         List {
-            // MARK: 1. 顶部双温区 Liquid Glass 流体形变状态舱 (GlassEffectContainer + glassEffectID)
+            // MARK: 1. 顶部双温区 Liquid Glass 流体形变状态舱 + 独立状态胶囊
             Section {
                 liquidGlassMorphingHeroHeader
             }
-            .listRowInsets(EdgeInsets(top: 6, leading: 4, bottom: 8, trailing: 4))
+            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
 
@@ -315,76 +316,82 @@ public struct DeviceControlView: View {
         }
     }
 
-    // MARK: - 顶部双温区 Liquid Glass 流体形变舱 (GlassEffectContainer + glassEffectID)
+    // MARK: - 顶部双温区 Liquid Glass 流体形变舱 + 独立无粘连状态胶囊
     private var liquidGlassMorphingHeroHeader: some View {
-        GlassEffectContainer(spacing: 16) {
-            VStack(spacing: 12) {
-                // 1. 双温区温度与挡位液态玻璃晶体（切换 syncDualZones 时触发真实 Liquid Glass Morphing 合并/分裂）
-                if device.syncDualZones {
-                    unifiedZoneGlassOrb
-                        .glassEffect(
-                            device.isOn
-                                ? .regular.tint(activeTint).interactive()
-                                : .regular.interactive(),
-                            in: .rect(cornerRadius: 26)
-                        )
-                        .glassEffectID("leftZone", in: glassMorphNamespace)
-                } else {
-                    HStack(spacing: 14) {
-                        singleZoneGlassOrb(
-                            title: "左温区",
-                            gear: device.gearLeft,
-                            temperature: device.temperatureLeft
-                        )
-                        .glassEffect(
-                            device.isOn
-                                ? .regular.tint(LiquidGlassTheme.thermalTint(isOn: true, mode: device.mode, gear: device.gearLeft)).interactive()
-                                : .regular.interactive(),
-                            in: .rect(cornerRadius: 24)
-                        )
-                        .glassEffectID("leftZone", in: glassMorphNamespace)
+        VStack(spacing: 14) {
+            // 1. 仅将左右温区放入 GlassEffectContainer(spacing: 6)（间距 16 > 阈值 6，平时边缘清晰不粘连，切换双区同步时触发流体融合形变）
+            // 容器内部四周预留充足 padding，避免 GlassEffectContainer 与 List Cell 裁切玻璃边缘阴影
+            GlassEffectContainer(spacing: 6) {
+                Group {
+                    if device.syncDualZones {
+                        unifiedZoneGlassOrb
+                            .glassEffect(
+                                device.isOn
+                                    ? .regular.tint(activeTint).interactive()
+                                    : .regular.interactive(),
+                                in: .rect(cornerRadius: 26)
+                            )
+                            .glassEffectID("leftZone", in: glassMorphNamespace)
+                    } else {
+                        HStack(spacing: 16) {
+                            singleZoneGlassOrb(
+                                title: "左温区",
+                                gear: device.gearLeft,
+                                temperature: device.temperatureLeft
+                            )
+                            .glassEffect(
+                                device.isOn
+                                    ? .regular.tint(LiquidGlassTheme.thermalTint(isOn: true, mode: device.mode, gear: device.gearLeft)).interactive()
+                                    : .regular.interactive(),
+                                in: .rect(cornerRadius: 24)
+                            )
+                            .glassEffectID("leftZone", in: glassMorphNamespace)
 
-                        singleZoneGlassOrb(
-                            title: "右温区",
-                            gear: device.gearRight,
-                            temperature: device.temperatureRight
-                        )
-                        .glassEffect(
-                            device.isOn
-                                ? .regular.tint(LiquidGlassTheme.thermalTint(isOn: true, mode: device.mode, gear: device.gearRight)).interactive()
-                                : .regular.interactive(),
-                            in: .rect(cornerRadius: 24)
-                        )
-                        .glassEffectID("rightZone", in: glassMorphNamespace)
+                            singleZoneGlassOrb(
+                                title: "右温区",
+                                gear: device.gearRight,
+                                temperature: device.temperatureRight
+                            )
+                            .glassEffect(
+                                device.isOn
+                                    ? .regular.tint(LiquidGlassTheme.thermalTint(isOn: true, mode: device.mode, gear: device.gearRight)).interactive()
+                                    : .regular.interactive(),
+                                in: .rect(cornerRadius: 24)
+                            )
+                            .glassEffectID("rightZone", in: glassMorphNamespace)
+                        }
                     }
                 }
-
-                // 2. 悬浮状态微胶囊对：本次已开启小时数 + 定时倒计时
-                HStack(spacing: 10) {
-                    Label(device.compactElapsedString(at: currentTime), systemImage: "clock.fill")
-                        .font(.caption.weight(.semibold).monospacedDigit())
-                        .contentTransition(.numericText())
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                        .glassEffect(
-                            device.isOn ? .regular.tint(activeTint).interactive() : .regular.interactive(),
-                            in: .capsule
-                        )
-                        .glassEffectID("elapsedPill", in: glassMorphNamespace)
-
-                    Label(
-                        device.isOn ? device.formattedRemainingCloseTime : device.formattedRemainingOpenTime,
-                        systemImage: device.isOn ? "timer" : "alarm.fill"
-                    )
-                    .font(.caption.weight(.medium).monospacedDigit())
-                    .contentTransition(.numericText())
-                    .lineLimit(1)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .glassEffect(.regular.interactive(), in: .capsule)
-                    .glassEffectID("countdownPill", in: glassMorphNamespace)
-                }
+                .padding(.horizontal, 14)
+                .padding(.top, 16)
+                .padding(.bottom, 10)
             }
+
+            // 2. 待机/已开启状态与预约/定时状态胶囊：移出 GlassEffectContainer 独立渲染，彻底消除两个胶囊之间及与上方温区之间的玻璃粘连
+            HStack(spacing: 14) {
+                Label(device.compactElapsedString(at: currentTime), systemImage: "clock.fill")
+                    .font(.caption.weight(.semibold).monospacedDigit())
+                    .contentTransition(.numericText())
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .glassEffect(
+                        device.isOn ? .regular.tint(activeTint).interactive() : .regular.interactive(),
+                        in: .capsule
+                    )
+
+                Label(
+                    device.isOn ? device.formattedRemainingCloseTime : device.formattedRemainingOpenTime,
+                    systemImage: device.isOn ? "timer" : "alarm.fill"
+                )
+                .font(.caption.weight(.medium).monospacedDigit())
+                .contentTransition(.numericText())
+                .lineLimit(1)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .glassEffect(.regular.interactive(), in: .capsule)
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 16)
         }
     }
 
