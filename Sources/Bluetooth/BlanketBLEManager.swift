@@ -75,6 +75,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
     private var debounceTasks: [String: Task<Void, Never>] = [:]
     private var saveDiskDebounceTask: Task<Void, Never>?
     private var isPoweringOnRestoringMemory: Set<UUID> = []
+    private var isExitingMiteRestoringState: Set<UUID> = []
     private var lastGearAccountingDates: [UUID: Date] = [:]
     private var lastNotifiedStates: [UUID: (isOn: Bool, gearLeft: Int, gearRight: Int, mode: BlanketHeatingMode, timeClose: Int)] = [:]
     private var isAppInBackground: Bool = false
@@ -986,20 +987,15 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
     }
 
     /// 4. 切换工作模式（普通加热 / 2小时高温除螨模式）
+    /// 开启或关闭除螨模式均保持当前 UI 界面已选挡位与定时不变；关闭除螨模式时自动忽略硬件回退的默认 9挡/12h 上报并将当前 UI 挡位与定时重新下发给设备
     @MainActor
     public func setMode(_ mode: BlanketHeatingMode, for deviceID: UUID) async {
         guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return }
         recordGearRuntimeSlice(for: deviceID)
         let prevMode = devices[idx].mode
         devices[idx].mode = mode
-        if mode == .miteRemoval {
-            devices[idx].gearLeft = 9
-            devices[idx].gearRight = 9
-            devices[idx].timeCloseHours = 2
-            devices[idx].remainingTimeCloseSec = 2 * 3600
-            if prevMode != .miteRemoval {
-                devices[idx].totalMiteRemovalCount += 1
-            }
+        if mode == .miteRemoval && prevMode != .miteRemoval {
+            devices[idx].totalMiteRemovalCount += 1
         }
         let needsPowerOn = !devices[idx].isOn
         if needsPowerOn {
@@ -1010,19 +1006,78 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                 devices[idx].totalPowerOnCount += 1
             }
             lastGearAccountingDates[deviceID] = now
+            devices[idx].remainingTimeCloseSec = devices[idx].timeCloseHours * 3600
         }
 
-        await runModeBLEPipeline(mode: mode, needsPowerOn: needsPowerOn, deviceID: deviceID)
+        let targetLeft = devices[idx].gearLeft
+        let targetRight = devices[idx].gearRight
+        let targetClose = devices[idx].timeCloseHours
+        let shouldRestoreAfterExitMite = (prevMode == .miteRemoval && mode == .normal)
+
+        if shouldRestoreAfterExitMite {
+            isExitingMiteRestoringState.insert(deviceID)
+        }
+
+        await runModeBLEPipeline(
+            mode: mode,
+            needsPowerOn: needsPowerOn,
+            shouldRestoreAfterExitMite: shouldRestoreAfterExitMite,
+            targetLeft: targetLeft,
+            targetRight: targetRight,
+            targetClose: targetClose,
+            deviceID: deviceID
+        )
+
+        if shouldRestoreAfterExitMite {
+            isExitingMiteRestoringState.remove(deviceID)
+        }
+        if let updatedSnapshot = devices.first(where: { $0.id == deviceID }) {
+            await LiveActivityManager.shared.syncActivityState(for: updatedSnapshot)
+        }
     }
 
-    private nonisolated func runModeBLEPipeline(mode: BlanketHeatingMode, needsPowerOn: Bool, deviceID: UUID) async {
+    private nonisolated func runModeBLEPipeline(
+        mode: BlanketHeatingMode,
+        needsPowerOn: Bool,
+        shouldRestoreAfterExitMite: Bool,
+        targetLeft: Int,
+        targetRight: Int,
+        targetClose: Int,
+        deviceID: UUID
+    ) async {
         if needsPowerOn {
             await sendCommand(BlanketProtocol.cmdPower(isOn: true), to: deviceID)
             try? await Task.sleep(nanoseconds: 350_000_000)
         }
         await sendCommand(BlanketProtocol.cmdMode(mode), to: deviceID)
+        if shouldRestoreAfterExitMite {
+            // 等待设备完成模式切换并上报默认 9挡/12h 状态（在此期间 applyParsedTLVToUI 会忽略该默认上报）
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            await sendCommand(BlanketProtocol.cmdGearLeft(targetLeft), to: deviceID)
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            await sendCommand(BlanketProtocol.cmdGearRight(targetRight), to: deviceID)
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            await sendCommand(BlanketProtocol.cmdTimeClose(hours: targetClose), to: deviceID)
+        }
         bleQueue.async { [weak self] in
-            self?.scheduleDelayedQueryOnBLEQueue(for: deviceID, delaySeconds: 0.55)
+            self?.scheduleDelayedQueryOnBLEQueue(for: deviceID, delaySeconds: 0.65)
+        }
+    }
+
+    private nonisolated func restoreUIGearAndTimerAfterMiteExit(
+        targetLeft: Int,
+        targetRight: Int,
+        targetClose: Int,
+        deviceID: UUID
+    ) async {
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        await sendCommand(BlanketProtocol.cmdGearLeft(targetLeft), to: deviceID)
+        try? await Task.sleep(nanoseconds: 220_000_000)
+        await sendCommand(BlanketProtocol.cmdGearRight(targetRight), to: deviceID)
+        try? await Task.sleep(nanoseconds: 220_000_000)
+        await sendCommand(BlanketProtocol.cmdTimeClose(hours: targetClose), to: deviceID)
+        bleQueue.async { [weak self] in
+            self?.scheduleDelayedQueryOnBLEQueue(for: deviceID, delaySeconds: 0.65)
         }
     }
 
@@ -1304,25 +1359,42 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             }
         }
 
+        var hardwareJustExitedMiteRemoval = false
         if let mode = tlv.mode, draft.mode != mode {
             let prevMode = draft.mode
             draft.mode = mode
             stateChanged = true
             liveActivityRelevantChanged = true
-            if mode == .miteRemoval {
-                draft.gearLeft = 9
-                draft.gearRight = 9
-                draft.timeCloseHours = 2
-                if draft.remainingTimeCloseSec == 0 || draft.remainingTimeCloseSec > 2 * 3600 {
-                    draft.remainingTimeCloseSec = 2 * 3600
-                }
-                if prevMode != .miteRemoval {
-                    draft.totalMiteRemovalCount += 1
-                }
-                timerChanged = true
+            if mode == .miteRemoval && prevMode != .miteRemoval {
+                draft.totalMiteRemovalCount += 1
+            } else if prevMode == .miteRemoval && mode == .normal {
+                hardwareJustExitedMiteRemoval = true
             }
         }
-        if let gl = tlv.gearLeft {
+
+        // 除螨模式运行期间、或刚退出除螨模式正在恢复用户 UI 挡位/定时期间，忽略设备上报的固定 9挡/2h 或退出除螨回退的默认 9挡/12h，保持 UI 挡位与定时不动
+        let shouldIgnoreMiteGearAndTimeReport = (draft.mode == .miteRemoval)
+            || isExitingMiteRestoringState.contains(deviceID)
+            || hardwareJustExitedMiteRemoval
+
+        if hardwareJustExitedMiteRemoval && !isExitingMiteRestoringState.contains(deviceID) {
+            let restoreLeft = draft.gearLeft
+            let restoreRight = draft.gearRight
+            let restoreClose = draft.timeCloseHours
+            isExitingMiteRestoringState.insert(deviceID)
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                await self.restoreUIGearAndTimerAfterMiteExit(
+                    targetLeft: restoreLeft,
+                    targetRight: restoreRight,
+                    targetClose: restoreClose,
+                    deviceID: deviceID
+                )
+                self.isExitingMiteRestoringState.remove(deviceID)
+            }
+        }
+
+        if let gl = tlv.gearLeft, !shouldIgnoreMiteGearAndTimeReport {
             if draft.gearLeft != gl {
                 draft.gearLeft = gl
                 stateChanged = true
@@ -1338,7 +1410,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                 }
             }
         }
-        if let gr = tlv.gearRight {
+        if let gr = tlv.gearRight, !shouldIgnoreMiteGearAndTimeReport {
             if draft.gearRight != gr {
                 draft.gearRight = gr
                 stateChanged = true
@@ -1354,7 +1426,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                 }
             }
         }
-        if let tc = tlv.timeCloseHours, tc > 0 {
+        if let tc = tlv.timeCloseHours, tc > 0, !shouldIgnoreMiteGearAndTimeReport {
             if draft.timeCloseHours != tc {
                 draft.timeCloseHours = tc
                 stateChanged = true
@@ -1388,7 +1460,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             stateChanged = true
             timerChanged = true
         }
-        if let remClose = tlv.remainingTimeCloseSec, abs(draft.remainingTimeCloseSec - remClose) >= 60 {
+        if let remClose = tlv.remainingTimeCloseSec, !shouldIgnoreMiteGearAndTimeReport, abs(draft.remainingTimeCloseSec - remClose) >= 60 {
             draft.remainingTimeCloseSec = remClose
             stateChanged = true
             timerChanged = true
