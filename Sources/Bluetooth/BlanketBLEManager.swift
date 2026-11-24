@@ -385,6 +385,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
         devices[idx].currentSessionStartDate = nil
         devices[idx].remainingTimeCloseSec = 0
+        devices[idx].autoOffTargetDate = nil
     }
 
     @MainActor
@@ -853,7 +854,12 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                 devices[idx].gearRight = 9
                 devices[idx].timeCloseHours = 12
             }
-            devices[idx].remainingTimeCloseSec = devices[idx].timeCloseHours * 3600
+            let effSec = devices[idx].effectiveTimeCloseHours * 3600
+            devices[idx].remainingTimeCloseSec = effSec
+            devices[idx].autoOffTargetDate = now.addingTimeInterval(TimeInterval(effSec))
+            devices[idx].timeOpenHours = 0
+            devices[idx].remainingTimeOpenSec = 0
+            devices[idx].scheduledOnTargetDate = nil
         } else if !isOn && wasOn {
             finalizeUsageSession(for: deviceID, endDate: now)
             devices[idx].isOn = false
@@ -992,6 +998,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
     public func setMode(_ mode: BlanketHeatingMode, for deviceID: UUID) async {
         guard let idx = devices.firstIndex(where: { $0.id == deviceID }) else { return }
         recordGearRuntimeSlice(for: deviceID)
+        let now = Date()
         let prevMode = devices[idx].mode
         devices[idx].mode = mode
         if mode == .miteRemoval && prevMode != .miteRemoval {
@@ -999,15 +1006,27 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         }
         let needsPowerOn = !devices[idx].isOn
         if needsPowerOn {
-            let now = Date()
             devices[idx].isOn = true
             if devices[idx].currentSessionStartDate == nil {
                 devices[idx].currentSessionStartDate = now
                 devices[idx].totalPowerOnCount += 1
             }
             lastGearAccountingDates[deviceID] = now
-            devices[idx].remainingTimeCloseSec = devices[idx].timeCloseHours * 3600
+            devices[idx].timeOpenHours = 0
+            devices[idx].remainingTimeOpenSec = 0
+            devices[idx].scheduledOnTargetDate = nil
         }
+
+        // 原版小程序除螨模式下硬件固定锁死 2 小时后关机；退出除螨模式后恢复为用户选择的 timeCloseHours 倒计时
+        if mode == .miteRemoval {
+            devices[idx].remainingTimeCloseSec = 2 * 3600
+            devices[idx].autoOffTargetDate = now.addingTimeInterval(TimeInterval(2 * 3600))
+        } else {
+            let closeSec = devices[idx].timeCloseHours * 3600
+            devices[idx].remainingTimeCloseSec = closeSec
+            devices[idx].autoOffTargetDate = now.addingTimeInterval(TimeInterval(closeSec))
+        }
+        PushNotificationManager.shared.scheduleBackgroundHardwareTimerNotifications(for: devices[idx])
 
         let targetLeft = devices[idx].gearLeft
         let targetRight = devices[idx].gearRight
@@ -1093,7 +1112,11 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         devices[idx].remainingTimeCloseSec = clamped * 3600
 
         guard devices[idx].isOn else { return }
+        devices[idx].autoOffTargetDate = Date().addingTimeInterval(TimeInterval(clamped * 3600))
         let snapshot = devices[idx]
+        Task { @MainActor in
+            await LiveActivityManager.shared.syncActivityState(for: snapshot)
+        }
 
         PushNotificationManager.shared.scheduleBackgroundHardwareTimerNotifications(for: snapshot)
         await runTimerCommandBLEPipeline(cmdHex: BlanketProtocol.cmdTimeClose(hours: clamped), deviceID: deviceID)
@@ -1108,6 +1131,7 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         let clamped = min(12, max(0, hours))
         devices[idx].timeOpenHours = clamped
         devices[idx].remainingTimeOpenSec = clamped * 3600
+        devices[idx].scheduledOnTargetDate = clamped > 0 ? Date().addingTimeInterval(TimeInterval(clamped * 3600)) : nil
         let snapshot = devices[idx]
 
         PushNotificationManager.shared.scheduleBackgroundHardwareTimerNotifications(for: snapshot)
@@ -1182,17 +1206,21 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             let devID = devices[idx].id
             if devices[idx].isOn {
                 recordGearRuntimeSlice(for: devID, upTo: now)
-                if devices[idx].remainingTimeCloseSec > 0 {
-                    devices[idx].remainingTimeCloseSec = max(0, devices[idx].remainingTimeCloseSec - 15)
-                    if devices[idx].remainingTimeCloseSec == 0 {
-                        Task.detached(priority: .utility) { [weak self] in
-                            await self?.queryStatus(for: devID)
-                        }
+                let remClose = devices[idx].effectiveRemainingCloseSeconds(at: now)
+                if devices[idx].remainingTimeCloseSec != remClose {
+                    devices[idx].remainingTimeCloseSec = remClose
+                }
+                if remClose == 0 {
+                    Task.detached(priority: .utility) { [weak self] in
+                        await self?.queryStatus(for: devID)
                     }
                 }
-            } else if devices[idx].timeOpenHours > 0 && devices[idx].remainingTimeOpenSec > 0 {
-                devices[idx].remainingTimeOpenSec = max(0, devices[idx].remainingTimeOpenSec - 15)
-                if devices[idx].remainingTimeOpenSec == 0 {
+            } else if devices[idx].timeOpenHours > 0 {
+                let remOpen = devices[idx].effectiveRemainingOpenSeconds(at: now)
+                if devices[idx].remainingTimeOpenSec != remOpen {
+                    devices[idx].remainingTimeOpenSec = remOpen
+                }
+                if remOpen == 0 {
                     Task.detached(priority: .utility) { [weak self] in
                         await self?.queryStatus(for: devID)
                     }
@@ -1332,13 +1360,14 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                 draft.totalPowerOnCount += 1
                 draft.timeOpenHours = 0
                 draft.remainingTimeOpenSec = 0
+                draft.scheduledOnTargetDate = nil
                 if tlv.gearLeft == nil { draft.gearLeft = 9 }
                 if tlv.gearRight == nil { draft.gearRight = 9 }
                 if tlv.timeCloseHours == nil { draft.timeCloseHours = 12 }
                 if tlv.mode == nil { draft.mode = .normal }
-                if draft.remainingTimeCloseSec == 0 {
-                    draft.remainingTimeCloseSec = draft.timeCloseHours * 3600
-                }
+                let effSec = draft.effectiveTimeCloseHours * 3600
+                draft.remainingTimeCloseSec = effSec
+                draft.autoOffTargetDate = now.addingTimeInterval(TimeInterval(effSec))
                 stateChanged = true
                 timerChanged = true
                 liveActivityRelevantChanged = true
@@ -1364,11 +1393,17 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             let prevMode = draft.mode
             draft.mode = mode
             stateChanged = true
+            timerChanged = true
             liveActivityRelevantChanged = true
             if mode == .miteRemoval && prevMode != .miteRemoval {
                 draft.totalMiteRemovalCount += 1
+                draft.remainingTimeCloseSec = 2 * 3600
+                draft.autoOffTargetDate = now.addingTimeInterval(TimeInterval(2 * 3600))
             } else if prevMode == .miteRemoval && mode == .normal {
                 hardwareJustExitedMiteRemoval = true
+                let closeSec = draft.timeCloseHours * 3600
+                draft.remainingTimeCloseSec = closeSec
+                draft.autoOffTargetDate = now.addingTimeInterval(TimeInterval(closeSec))
             }
         }
 
@@ -1429,6 +1464,10 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         if let tc = tlv.timeCloseHours, tc > 0, !shouldIgnoreMiteGearAndTimeReport {
             if draft.timeCloseHours != tc {
                 draft.timeCloseHours = tc
+                if draft.isOn {
+                    draft.remainingTimeCloseSec = tc * 3600
+                    draft.autoOffTargetDate = now.addingTimeInterval(TimeInterval(tc * 3600))
+                }
                 stateChanged = true
                 timerChanged = true
                 liveActivityRelevantChanged = true
@@ -1437,8 +1476,11 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
                 draft.savedTimeCloseHours = tc
                 stateChanged = true
             }
-            if draft.remainingTimeCloseSec == 0 && draft.isOn {
-                draft.remainingTimeCloseSec = tc * 3600
+            if draft.autoOffTargetDate == nil && draft.isOn {
+                let elapsed = draft.currentSessionStartDate.map { max(0, Int(now.timeIntervalSince($0))) } ?? 0
+                let rem = max(0, tc * 3600 - elapsed)
+                draft.remainingTimeCloseSec = rem
+                draft.autoOffTargetDate = now.addingTimeInterval(TimeInterval(rem))
                 stateChanged = true
                 timerChanged = true
             }
@@ -1446,24 +1488,37 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         if let to = tlv.timeOpenHours {
             if draft.timeOpenHours != to {
                 draft.timeOpenHours = to
+                draft.remainingTimeOpenSec = to * 3600
+                draft.scheduledOnTargetDate = to > 0 ? now.addingTimeInterval(TimeInterval(to * 3600)) : nil
                 stateChanged = true
                 timerChanged = true
             }
-            if to == 0 && draft.remainingTimeOpenSec != 0 {
+            if to == 0 && (draft.remainingTimeOpenSec != 0 || draft.scheduledOnTargetDate != nil) {
                 draft.remainingTimeOpenSec = 0
+                draft.scheduledOnTargetDate = nil
                 stateChanged = true
                 timerChanged = true
             }
         }
-        if let remOpen = tlv.remainingTimeOpenSec, abs(draft.remainingTimeOpenSec - remOpen) >= 60 {
-            draft.remainingTimeOpenSec = remOpen
-            stateChanged = true
-            timerChanged = true
+        if let remOpen = tlv.remainingTimeOpenSec, remOpen > 0 {
+            let currentRemOpen = draft.effectiveRemainingOpenSeconds(at: now)
+            if abs(currentRemOpen - remOpen) >= 60 {
+                draft.remainingTimeOpenSec = remOpen
+                draft.scheduledOnTargetDate = now.addingTimeInterval(TimeInterval(remOpen))
+                stateChanged = true
+                timerChanged = true
+            }
         }
-        if let remClose = tlv.remainingTimeCloseSec, !shouldIgnoreMiteGearAndTimeReport, abs(draft.remainingTimeCloseSec - remClose) >= 60 {
-            draft.remainingTimeCloseSec = remClose
-            stateChanged = true
-            timerChanged = true
+        // 当硬件上报精确的剩余关机秒数（9b020004）时（无论普通模式还是除螨模式，只要不处于退出除螨恢复过程中），同步校准倒计时截止时间
+        if let remClose = tlv.remainingTimeCloseSec, remClose > 0, !isExitingMiteRestoringState.contains(deviceID) && !hardwareJustExitedMiteRemoval {
+            let currentRemClose = draft.effectiveRemainingCloseSeconds(at: now)
+            if abs(currentRemClose - remClose) >= 60 {
+                draft.remainingTimeCloseSec = remClose
+                draft.autoOffTargetDate = now.addingTimeInterval(TimeInterval(remClose))
+                stateChanged = true
+                timerChanged = true
+                liveActivityRelevantChanged = true
+            }
         }
 
         let syncStale = draft.lastSyncDate.map { now.timeIntervalSince($0) >= 15.0 } ?? true

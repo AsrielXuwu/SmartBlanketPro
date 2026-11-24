@@ -192,20 +192,22 @@ public final class PushNotificationManager: NSObject, UIApplicationDelegate, UNU
 
             guard enabled else { return }
 
-            if device.isOn && device.remainingTimeCloseSec > 5 {
+            let remClose = device.effectiveRemainingCloseSeconds()
+            if device.isOn && remClose > 5 {
                 self.scheduleSystemNotification(
                     title: "❄️ \(device.name) 已到点自动关机",
-                    body: "设定的 \(device.timeCloseHours) 小时自动关机定时已完成，电热毯已安全停止加热。",
-                    delay: TimeInterval(device.remainingTimeCloseSec),
+                    body: "设定的 \(device.effectiveTimeCloseHours) 小时自动关机定时已完成，电热毯已安全停止加热。",
+                    delay: TimeInterval(remClose),
                     identifier: closeID
                 )
             }
 
-            if !device.isOn && device.timeOpenHours > 0 && device.remainingTimeOpenSec > 5 {
+            let remOpen = device.effectiveRemainingOpenSeconds()
+            if !device.isOn && device.timeOpenHours > 0 && remOpen > 5 {
                 self.scheduleSystemNotification(
                     title: "🔥 \(device.name) 预约定时开机已启动",
                     body: "预约的 \(device.timeOpenHours) 小时开机时间已到，电热毯已开始为您暖被。",
-                    delay: TimeInterval(device.remainingTimeOpenSec),
+                    delay: TimeInterval(remOpen),
                     identifier: openID
                 )
             }

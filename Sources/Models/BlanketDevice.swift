@@ -118,6 +118,10 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
     public var remainingTimeOpenSec: Int
     /// 剩余自动关机秒数（硬件上报 + 本地平滑推算）
     public var remainingTimeCloseSec: Int
+    /// 自动关机倒计时目标截止时间戳（使用绝对时间锚点，切入后台再回前台绝不暂停或回跳）
+    public var autoOffTargetDate: Date?
+    /// 预约开机倒计时目标截止时间戳
+    public var scheduledOnTargetDate: Date?
 
     // MARK: - 偏好记忆与智能策略
     /// 是否启用双温区同步调节
@@ -168,6 +172,8 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
         timeOpenHours: Int = 0,
         remainingTimeOpenSec: Int = 0,
         remainingTimeCloseSec: Int = 0,
+        autoOffTargetDate: Date? = nil,
+        scheduledOnTargetDate: Date? = nil,
         syncDualZones: Bool = false,
         restoreMemoryOnPowerOn: Bool = true,
         savedGearLeft: Int = 5,
@@ -198,6 +204,8 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
         self.timeOpenHours = timeOpenHours
         self.remainingTimeOpenSec = remainingTimeOpenSec
         self.remainingTimeCloseSec = remainingTimeCloseSec
+        self.autoOffTargetDate = autoOffTargetDate
+        self.scheduledOnTargetDate = scheduledOnTargetDate
         self.syncDualZones = syncDualZones
         self.restoreMemoryOnPowerOn = restoreMemoryOnPowerOn
         self.savedGearLeft = savedGearLeft
@@ -233,6 +241,8 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
         timeOpenHours = try c.decodeIfPresent(Int.self, forKey: .timeOpenHours) ?? 0
         remainingTimeOpenSec = try c.decodeIfPresent(Int.self, forKey: .remainingTimeOpenSec) ?? 0
         remainingTimeCloseSec = try c.decodeIfPresent(Int.self, forKey: .remainingTimeCloseSec) ?? 0
+        autoOffTargetDate = try c.decodeIfPresent(Date.self, forKey: .autoOffTargetDate)
+        scheduledOnTargetDate = try c.decodeIfPresent(Date.self, forKey: .scheduledOnTargetDate)
         syncDualZones = try c.decodeIfPresent(Bool.self, forKey: .syncDualZones) ?? false
         restoreMemoryOnPowerOn = try c.decodeIfPresent(Bool.self, forKey: .restoreMemoryOnPowerOn) ?? true
         savedGearLeft = try c.decodeIfPresent(Int.self, forKey: .savedGearLeft) ?? 5
@@ -261,19 +271,43 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
         BlanketProtocol.gearToTemp(gearRight)
     }
 
-    /// 当前会话已开启的秒数（优先结合硬件倒计时差值与本地开机时间戳）
+    /// 当前实际生效的定时关机小时数（原版小程序除螨模式下固定锁死 2 小时关机，普通模式下为用户选择的 timeCloseHours）
+    public var effectiveTimeCloseHours: Int {
+        mode == .miteRemoval ? 2 : max(1, timeCloseHours)
+    }
+
+    /// 基于绝对时间戳 (`autoOffTargetDate` / `currentSessionStartDate`) 计算当前真实剩余自动关机秒数（彻底解决切入后台 Timer 暂停导致倒计时停滞回跳的问题）
+    public func effectiveRemainingCloseSeconds(at now: Date = Date()) -> Int {
+        guard isOn else { return 0 }
+        if let target = autoOffTargetDate {
+            return max(0, Int(target.timeIntervalSince(now)))
+        }
+        let totalSec = effectiveTimeCloseHours * 3600
+        if let start = currentSessionStartDate {
+            let elapsed = max(0, Int(now.timeIntervalSince(start)))
+            return max(0, totalSec - elapsed)
+        }
+        return remainingTimeCloseSec > 0 ? remainingTimeCloseSec : totalSec
+    }
+
+    /// 基于绝对时间戳 (`scheduledOnTargetDate`) 计算当前真实剩余预约开机秒数
+    public func effectiveRemainingOpenSeconds(at now: Date = Date()) -> Int {
+        guard !isOn, timeOpenHours > 0 else { return 0 }
+        if let target = scheduledOnTargetDate {
+            return max(0, Int(target.timeIntervalSince(now)))
+        }
+        return remainingTimeOpenSec > 0 ? remainingTimeOpenSec : (timeOpenHours * 3600)
+    }
+
+    /// 当前会话已开启的秒数（基于开机时间戳 `currentSessionStartDate` 实时计算）
     public func currentSessionElapsedSeconds(at now: Date = Date()) -> Int {
         guard isOn else { return 0 }
-        let totalCloseSec = max(1, timeCloseHours) * 3600
-        let hardwareElapsedSec = (remainingTimeCloseSec > 0 && remainingTimeCloseSec <= totalCloseSec)
-            ? (totalCloseSec - remainingTimeCloseSec)
-            : 0
-
         if let start = currentSessionStartDate {
-            let localElapsed = max(0, Int(now.timeIntervalSince(start)))
-            return max(localElapsed, hardwareElapsedSec)
+            return max(0, Int(now.timeIntervalSince(start)))
         }
-        return hardwareElapsedSec
+        let totalCloseSec = effectiveTimeCloseHours * 3600
+        let rem = effectiveRemainingCloseSeconds(at: now)
+        return (rem > 0 && rem <= totalCloseSec) ? (totalCloseSec - rem) : 0
     }
 
     /// 当前会话已开启的小时数描述
@@ -467,10 +501,10 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
         return points
     }
 
-    /// 格式化剩余自动关机时间
+    /// 格式化剩余自动关机时间（实时按当前墙钟时间计算，后台唤醒后零误差）
     public var formattedRemainingCloseTime: String {
         guard isOn else { return "未启动" }
-        let sec = remainingTimeCloseSec > 0 ? remainingTimeCloseSec : (timeCloseHours * 3600)
+        let sec = effectiveRemainingCloseSeconds()
         let h = sec / 3600
         let m = (sec % 3600) / 60
         return String(format: "%d 小时 %02d 分后自动关机", h, m)
@@ -479,7 +513,7 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
     /// 格式化剩余预约开机时间
     public var formattedRemainingOpenTime: String {
         guard timeOpenHours > 0 else { return "预约开机：关闭" }
-        let sec = remainingTimeOpenSec > 0 ? remainingTimeOpenSec : (timeOpenHours * 3600)
+        let sec = effectiveRemainingOpenSeconds()
         let h = sec / 3600
         let m = (sec % 3600) / 60
         return String(format: "%d 小时 %02d 分后自动开机", h, m)

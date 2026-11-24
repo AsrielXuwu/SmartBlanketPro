@@ -28,8 +28,11 @@ public final class LiveActivityManager: ObservableObject, @unchecked Sendable {
         let now = Date()
         let autoOffDate: Date? = {
             guard device.isOn else { return nil }
-            let sec = device.remainingTimeCloseSec > 0 ? device.remainingTimeCloseSec : (device.timeCloseHours * 3600)
-            return now.addingTimeInterval(TimeInterval(max(60, sec)))
+            if let target = device.autoOffTargetDate, target > now {
+                return target
+            }
+            let sec = device.effectiveRemainingCloseSeconds(at: now)
+            return now.addingTimeInterval(TimeInterval(max(1, sec)))
         }()
 
         return BlanketActivityAttributes.ContentState(
