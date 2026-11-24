@@ -31,21 +31,21 @@ public struct BlanketDeviceEntity: AppEntity, Identifiable, Sendable {
 public struct BlanketDeviceEntityQuery: EntityQuery {
     public init() {}
 
-    @MainActor
     public func entities(for identifiers: [UUID]) async throws -> [BlanketDeviceEntity] {
-        BlanketBLEManager.shared.devices
+        let snapshot = BlanketBLEManager.loadSavedDevicesSnapshot()
+        return snapshot
             .filter { identifiers.contains($0.id) }
             .map { BlanketDeviceEntity(from: $0) }
     }
 
-    @MainActor
     public func suggestedEntities() async throws -> [BlanketDeviceEntity] {
-        BlanketBLEManager.shared.devices.map { BlanketDeviceEntity(from: $0) }
+        let snapshot = BlanketBLEManager.loadSavedDevicesSnapshot()
+        return snapshot.map { BlanketDeviceEntity(from: $0) }
     }
 
-    @MainActor
     public func defaultResult() async -> BlanketDeviceEntity? {
-        guard let first = BlanketBLEManager.shared.activeDevice else { return nil }
+        let snapshot = BlanketBLEManager.loadSavedDevicesSnapshot()
+        guard let first = snapshot.first else { return nil }
         return BlanketDeviceEntity(from: first)
     }
 }
@@ -120,7 +120,7 @@ public struct ControlBlanketPowerIntent: AppIntent {
     @MainActor
     public func perform() async throws -> some IntentResult & ProvidesDialog {
         let manager = BlanketBLEManager.shared
-        guard let target = manager.devices.first(where: { $0.id == device.id }) else {
+        guard let target = manager.devices.first(where: { $0.id == device.id }) ?? manager.devices.first else {
             return .result(dialog: "未找到指定的电热毯设备。")
         }
 
@@ -267,7 +267,7 @@ public struct GetBlanketStatusIntent: AppIntent {
     public func perform() async throws -> some IntentResult & ProvidesDialog & ReturnsValue<String> {
         let manager = BlanketBLEManager.shared
         await manager.queryStatus(for: device.id)
-        guard let current = manager.devices.first(where: { $0.id == device.id }) else {
+        guard let current = manager.devices.first(where: { $0.id == device.id }) ?? manager.devices.first else {
             return .result(value: "未找到设备", dialog: "未找到指定的电热毯设备。")
         }
 
@@ -288,7 +288,7 @@ public struct BlanketShortcutsProvider: AppShortcutsProvider {
             intent: ControlBlanketPowerIntent(),
             phrases: [
                 "用 \(.applicationName) 开启电热毯",
-                "用 \(.applicationName) 控制 \(\.$device) 开关"
+                "用 \(.applicationName) 控制电热毯开关"
             ],
             shortTitle: "开关电热毯",
             systemImageName: "power"
@@ -297,7 +297,7 @@ public struct BlanketShortcutsProvider: AppShortcutsProvider {
             intent: SetBlanketGearIntent(),
             phrases: [
                 "用 \(.applicationName) 调节电热毯挡位",
-                "用 \(.applicationName) 设置 \(\.$device) 温度挡位"
+                "用 \(.applicationName) 设置电热毯温度"
             ],
             shortTitle: "调节温区挡位",
             systemImageName: "thermometer.medium"
@@ -306,7 +306,7 @@ public struct BlanketShortcutsProvider: AppShortcutsProvider {
             intent: SetBlanketModeIntent(),
             phrases: [
                 "用 \(.applicationName) 开启电热毯除螨模式",
-                "用 \(.applicationName) 切换 \(\.$device) 模式"
+                "用 \(.applicationName) 切换电热毯模式"
             ],
             shortTitle: "切换除螨/加热模式",
             systemImageName: "sparkles"

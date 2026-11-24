@@ -24,7 +24,7 @@ jobs:
           xcodegen generate
           ls -la SmartBlanketPro.xcodeproj
 
-      - name: 3. Build Release .app via xcodebuild (Unsigned for AltStore / SideStore / Sideloadly)
+      - name: 3. Build Release .app via xcodebuild
         run: |
           xcodebuild clean build \
             -project SmartBlanketPro.xcodeproj \
@@ -38,12 +38,16 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             AD_HOC_CODE_SIGNING_ALLOWED=YES
 
-      - name: 4. Package Payload into SmartBlanketPro.ipa
+      - name: 4. Verify Info.plist & Ad-Hoc Sign & Package IPA
         run: |
           APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -name "SmartBlanketPro.app" -type d | head -n 1)
           echo "Found compiled app at: $APP_PATH"
+          echo "=== Verifying Info.plist contains NSBluetoothAlwaysUsageDescription ==="
+          plutil -p "$APP_PATH/Info.plist"
           mkdir -p "$RUNNER_TEMP/ipa_build/Payload"
           cp -R "$APP_PATH" "$RUNNER_TEMP/ipa_build/Payload/SmartBlanketPro.app"
+          # Ad-hoc sign binary so Mach-O LC_CODE_SIGNATURE is valid across iOS 17~27 & sideloaders
+          codesign --force --deep --sign - "$RUNNER_TEMP/ipa_build/Payload/SmartBlanketPro.app"
           cd "$RUNNER_TEMP/ipa_build"
           zip -qry "$GITHUB_WORKSPACE/SmartBlanketPro-Unsigned.ipa" Payload
           ls -lh "$GITHUB_WORKSPACE/SmartBlanketPro-Unsigned.ipa"

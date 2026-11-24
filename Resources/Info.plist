@@ -26,10 +26,6 @@
 	<string>需要使用蓝牙扫描并直连控制您的晶合物联智能电热毯，实现极速开关、双温区调挡、定时与快捷指令自动化。</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
 	<string>需要使用蓝牙连接您的智能电热毯以同步实时温度、挡位和开启时长。</string>
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>bluetooth-central</string>
-	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
