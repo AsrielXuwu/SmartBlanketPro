@@ -120,8 +120,8 @@ public struct BlanketLiveActivityWidget: Widget {
                 }
             } compactTrailing: {
                 if context.state.isOn {
-                    Text("\(max(context.state.tempLeft, context.state.tempRight))°C")
-                        .font(.system(size: 12, weight: .bold, design: .rounded).monospacedDigit())
+                    Text(context.state.isMiteRemoval ? "除螨" : "加热")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
                         .foregroundStyle(context.state.themeColor)
                 } else {
                     Text("已关")

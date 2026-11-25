@@ -555,18 +555,29 @@ public struct RuntimeStatusView: View {
                     .foregroundStyle(.secondary)
 
                 ForEach(recentSessions) { rec in
+                    let lGear = (rec.mode == .miteRemoval) ? 9 : rec.gearLeft
+                    let rGear = (rec.mode == .miteRemoval) ? 9 : rec.gearRight
+                    let domGear = max(lGear, rGear)
+                    let gearSummaryText: String = {
+                        if rec.mode == .miteRemoval {
+                            return "9挡 (45°C) · \(rec.mode.title)"
+                        } else if lGear == rGear {
+                            return "双区 \(lGear)挡 (\(BlanketProtocol.gearToTemp(lGear))°C) · \(rec.mode.title)"
+                        } else {
+                            return "左\(lGear)挡/右\(rGear)挡 · \(rec.mode.title)"
+                        }
+                    }()
+
                     HStack {
                         Circle()
-                            .fill(LiquidGlassTheme.gearColor(for: rec.primaryGear, mode: rec.mode))
+                            .fill(LiquidGlassTheme.gearColor(for: domGear, mode: rec.mode))
                             .frame(width: 8, height: 8)
                         Text(rec.startDate.formatted(date: .abbreviated, time: .shortened))
                             .font(.caption2.monospacedDigit())
                         Spacer()
-                        let recGear = (rec.mode == .miteRemoval) ? 9 : rec.primaryGear
-                        let recTemp = BlanketProtocol.gearToTemp(recGear)
-                        Text("\(recGear)挡 (\(recTemp)°C) · \(rec.mode.title)")
+                        Text(gearSummaryText)
                             .font(.caption2.weight(.medium))
-                            .foregroundStyle(LiquidGlassTheme.gearColor(for: recGear, mode: rec.mode))
+                            .foregroundStyle(LiquidGlassTheme.gearColor(for: domGear, mode: rec.mode))
                         Text(String(format: "%.2f h", rec.durationSeconds / 3600.0))
                             .font(.caption2.weight(.semibold).monospacedDigit())
                             .foregroundStyle(.secondary)

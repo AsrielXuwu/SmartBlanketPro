@@ -36,13 +36,15 @@ public enum DeviceConnectionPhase: String, Codable, Sendable {
     }
 }
 
-/// 单次电热毯开启运行历史记录条目（用于统计本周/本月时长、各挡位时长与绘制历史图表）
+/// 单次电热毯开启运行历史记录条目（完整记录左右双温区各自的挡位、运行时长与工作模式）
 public struct BlanketUsageRecord: Identifiable, Codable, Hashable, Sendable {
     public var id: UUID
     public var startDate: Date
     public var endDate: Date
     public var durationSeconds: TimeInterval
     public var primaryGear: Int
+    public var gearLeft: Int
+    public var gearRight: Int
     public var mode: BlanketHeatingMode
 
     public init(
@@ -51,14 +53,36 @@ public struct BlanketUsageRecord: Identifiable, Codable, Hashable, Sendable {
         endDate: Date,
         durationSeconds: TimeInterval,
         primaryGear: Int,
+        gearLeft: Int? = nil,
+        gearRight: Int? = nil,
         mode: BlanketHeatingMode = .normal
     ) {
+        let clampedPrimary = min(9, max(1, primaryGear))
+        let clampedLeft = min(9, max(1, gearLeft ?? clampedPrimary))
+        let clampedRight = min(9, max(1, gearRight ?? clampedPrimary))
         self.id = id
         self.startDate = startDate
         self.endDate = endDate
         self.durationSeconds = max(0, durationSeconds)
-        self.primaryGear = min(9, max(1, primaryGear))
+        self.primaryGear = max(clampedLeft, clampedRight)
+        self.gearLeft = clampedLeft
+        self.gearRight = clampedRight
         self.mode = mode
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        startDate = try c.decode(Date.self, forKey: .startDate)
+        endDate = try c.decode(Date.self, forKey: .endDate)
+        durationSeconds = max(0, try c.decodeIfPresent(TimeInterval.self, forKey: .durationSeconds) ?? 0)
+        let pGear = min(9, max(1, try c.decodeIfPresent(Int.self, forKey: .primaryGear) ?? 5))
+        let lGear = min(9, max(1, try c.decodeIfPresent(Int.self, forKey: .gearLeft) ?? pGear))
+        let rGear = min(9, max(1, try c.decodeIfPresent(Int.self, forKey: .gearRight) ?? pGear))
+        primaryGear = max(lGear, rGear)
+        gearLeft = lGear
+        gearRight = rGear
+        mode = try c.decodeIfPresent(BlanketHeatingMode.self, forKey: .mode) ?? .normal
     }
 }
 
@@ -404,17 +428,26 @@ public struct BlanketDevice: Identifiable, Codable, Hashable, Sendable {
         for g in 1...9 {
             combined[g] = gearUsageSeconds[g] ?? 0
         }
-        // 叠加历史记录中尚未合入字典的条目
+        // 叠加历史记录中尚未合入字典的条目（左右温区不同挡位时分别计入两个挡位，相同挡位时计入一次）
         if gearUsageSeconds.isEmpty {
             for rec in usageRecords {
-                combined[rec.primaryGear, default: 0] += rec.durationSeconds
+                let lGear = (rec.mode == .miteRemoval) ? 9 : min(9, max(1, rec.gearLeft))
+                let rGear = (rec.mode == .miteRemoval) ? 9 : min(9, max(1, rec.gearRight))
+                combined[lGear, default: 0] += rec.durationSeconds
+                if rGear != lGear {
+                    combined[rGear, default: 0] += rec.durationSeconds
+                }
             }
         }
-        // 叠加当前正在运行的会话秒数
-        if isOn {
+        // 叠加当前尚未由 15 秒定时器切片落账的增量秒数（左右温区各自统计）
+        if isOn, gearUsageSeconds.isEmpty {
             let currentElapsed = TimeInterval(currentSessionElapsedSeconds(at: now))
-            let activeGear = max(gearLeft, gearRight)
-            combined[activeGear, default: 0] += currentElapsed
+            let lGear = (mode == .miteRemoval) ? 9 : min(9, max(1, gearLeft))
+            let rGear = (mode == .miteRemoval) ? 9 : min(9, max(1, gearRight))
+            combined[lGear, default: 0] += currentElapsed
+            if rGear != lGear {
+                combined[rGear, default: 0] += currentElapsed
+            }
         }
 
         let totalSec = max(1.0, combined.values.reduce(0, +))

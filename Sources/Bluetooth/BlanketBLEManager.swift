@@ -362,8 +362,16 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         if let lastTick = lastGearAccountingDates[deviceID] {
             let delta = max(0, now.timeIntervalSince(lastTick))
             if delta >= 1.0 && delta <= 12 * 3600 {
-                let domGear = (devices[idx].mode == .miteRemoval) ? 9 : min(9, max(1, max(devices[idx].gearLeft, devices[idx].gearRight)))
-                devices[idx].gearUsageSeconds[domGear, default: 0] += delta
+                if devices[idx].mode == .miteRemoval {
+                    devices[idx].gearUsageSeconds[9, default: 0] += delta
+                } else {
+                    let lGear = min(9, max(1, devices[idx].gearLeft))
+                    let rGear = min(9, max(1, devices[idx].gearRight))
+                    devices[idx].gearUsageSeconds[lGear, default: 0] += delta
+                    if rGear != lGear {
+                        devices[idx].gearUsageSeconds[rGear, default: 0] += delta
+                    }
+                }
             }
         }
         lastGearAccountingDates[deviceID] = now
@@ -384,12 +392,16 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             let elapsed = max(0, endDate.timeIntervalSince(start))
             if elapsed >= 5 {
                 devices[idx].accumulatedRuntimeSeconds += elapsed
-                let domGear = (devices[idx].mode == .miteRemoval) ? 9 : min(9, max(1, max(devices[idx].gearLeft, devices[idx].gearRight)))
+                let lGear = (devices[idx].mode == .miteRemoval) ? 9 : min(9, max(1, devices[idx].gearLeft))
+                let rGear = (devices[idx].mode == .miteRemoval) ? 9 : min(9, max(1, devices[idx].gearRight))
+                let domGear = max(lGear, rGear)
                 let record = BlanketUsageRecord(
                     startDate: start,
                     endDate: endDate,
                     durationSeconds: elapsed,
                     primaryGear: domGear,
+                    gearLeft: lGear,
+                    gearRight: rGear,
                     mode: devices[idx].mode
                 )
                 devices[idx].usageRecords.append(record)
@@ -451,8 +463,14 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
         let removedMiteCount = toRemove.filter { $0.mode == .miteRemoval }.count
 
         for rec in toRemove {
-            let currentGearSec = devices[idx].gearUsageSeconds[rec.primaryGear] ?? 0
-            devices[idx].gearUsageSeconds[rec.primaryGear] = max(0, currentGearSec - rec.durationSeconds)
+            let lGear = (rec.mode == .miteRemoval) ? 9 : min(9, max(1, rec.gearLeft))
+            let rGear = (rec.mode == .miteRemoval) ? 9 : min(9, max(1, rec.gearRight))
+            let curLeftSec = devices[idx].gearUsageSeconds[lGear] ?? 0
+            devices[idx].gearUsageSeconds[lGear] = max(0, curLeftSec - rec.durationSeconds)
+            if rGear != lGear {
+                let curRightSec = devices[idx].gearUsageSeconds[rGear] ?? 0
+                devices[idx].gearUsageSeconds[rGear] = max(0, curRightSec - rec.durationSeconds)
+            }
         }
 
         devices[idx].usageRecords.removeAll { $0.endDate >= startDate && $0.endDate <= endDate }
