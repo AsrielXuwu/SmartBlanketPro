@@ -66,28 +66,27 @@ public struct RuntimeStatusView: View {
 
     public var body: some View {
         List {
-            // MARK: 1. 顶部两个 1x1 卡片 + 动态图表 + 其余小组件置于同一 Section 的独立行中（消除跨 Section 默认大间距，保持精确 14pt 间距且展开不跳动）
+            // MARK: 1. 顶部 1/2/3/4 行所有 Bento 小组件与动态展开图表统一置于单一顶对齐 VStack(spacing: 14) 容器内
+            // 彻底消除跨行间距不一致，并杜绝展开/切换图表或切换「仅看前5/全部9挡」时 UITableView 单元格重算高度引发的上跳
             Section {
-                topTwoSummaryCardsRow
-                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
+                VStack(alignment: .leading, spacing: 14) {
+                    topTwoSummaryCardsRow
 
-                if let activeChart = expandedChart {
-                    expandedRuntimeChartCard(for: activeChart)
-                        .glassEffect(.regular, in: .rect(cornerRadius: 24))
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 7)
-                        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
-                        .transition(.opacity)
+                    if let activeChart = expandedChart {
+                        expandedRuntimeChartCard(for: activeChart)
+                            .glassEffect(.regular, in: .rect(cornerRadius: 24))
+                            .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+                    }
+
+                    lowerBentoWidgetsGrid
                 }
-
-                lowerBentoWidgetsGrid
-                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
+                .padding(.horizontal, 20)
+                .padding(.top, 16)
+                .padding(.bottom, 18)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
             }
             .listSectionMargins(.horizontal, 0)
 
@@ -348,9 +347,6 @@ public struct RuntimeStatusView: View {
             .buttonStyle(.plain)
             .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
         }
-        .padding(.horizontal, 20)
-        .padding(.top, 16)
-        .padding(.bottom, 7)
     }
 
     // MARK: - 其余 iOS 小组件 Bento 网格
@@ -416,9 +412,6 @@ public struct RuntimeStatusView: View {
             gearUsageRanking2x2WidgetCard
                 .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
         }
-        .padding(.horizontal, 20)
-        .padding(.top, 7)
-        .padding(.bottom, 18)
     }
 
     // MARK: - 点击顶部卡片展开的 2x2 详细运行记录图表卡片 (Requirement 7)

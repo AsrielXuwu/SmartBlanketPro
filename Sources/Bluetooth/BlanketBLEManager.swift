@@ -1101,19 +1101,28 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             devices[idx].totalMiteRemovalCount += 1
         }
 
-        // 原版小程序除螨模式下硬件固定锁死 2 小时后关机；退出除螨模式后恢复为用户选择的 timeCloseHours 倒计时
+        // 开启除螨模式时界面显示挡位切换为 9/9 挡（保留 savedGearLeft / savedGearRight 记忆），并锁死 2 小时关机倒计时；
+        // 关闭除螨模式时立即恢复为用户开启除螨前选择的 savedGearLeft / savedGearRight 与 timeCloseHours
         if mode == .miteRemoval {
+            if prevMode != .miteRemoval {
+                devices[idx].savedGearLeft = devices[idx].gearLeft
+                devices[idx].savedGearRight = devices[idx].gearRight
+            }
+            devices[idx].gearLeft = 9
+            devices[idx].gearRight = 9
             devices[idx].remainingTimeCloseSec = 2 * 3600
             devices[idx].autoOffTargetDate = now.addingTimeInterval(TimeInterval(2 * 3600))
         } else {
+            devices[idx].gearLeft = devices[idx].savedGearLeft
+            devices[idx].gearRight = devices[idx].savedGearRight
             let closeSec = devices[idx].timeCloseHours * 3600
             devices[idx].remainingTimeCloseSec = closeSec
             devices[idx].autoOffTargetDate = now.addingTimeInterval(TimeInterval(closeSec))
         }
         PushNotificationManager.shared.scheduleBackgroundHardwareTimerNotifications(for: devices[idx])
 
-        let targetLeft = devices[idx].gearLeft
-        let targetRight = devices[idx].gearRight
+        let targetLeft = devices[idx].savedGearLeft
+        let targetRight = devices[idx].savedGearRight
         let targetClose = devices[idx].timeCloseHours
         let shouldRestoreAfterExitMite = (prevMode == .miteRemoval && mode == .normal)
 
@@ -1520,24 +1529,30 @@ public final class BlanketBLEManager: NSObject, ObservableObject, @unchecked Sen
             liveActivityRelevantChanged = true
             if mode == .miteRemoval && prevMode != .miteRemoval {
                 draft.totalMiteRemovalCount += 1
+                draft.savedGearLeft = draft.gearLeft
+                draft.savedGearRight = draft.gearRight
+                draft.gearLeft = 9
+                draft.gearRight = 9
                 draft.remainingTimeCloseSec = 2 * 3600
                 draft.autoOffTargetDate = now.addingTimeInterval(TimeInterval(2 * 3600))
             } else if prevMode == .miteRemoval && mode == .normal {
                 hardwareJustExitedMiteRemoval = true
+                draft.gearLeft = draft.savedGearLeft
+                draft.gearRight = draft.savedGearRight
                 let closeSec = draft.timeCloseHours * 3600
                 draft.remainingTimeCloseSec = closeSec
                 draft.autoOffTargetDate = now.addingTimeInterval(TimeInterval(closeSec))
             }
         }
 
-        // 除螨模式运行期间、或刚退出除螨模式正在恢复用户 UI 挡位/定时期间，忽略设备上报的固定 9挡/2h 或退出除螨回退的默认 9挡/12h，保持 UI 挡位与定时不动
+        // 除螨模式运行期间、或刚退出除螨模式正在恢复用户 UI 挡位/定时期间，忽略设备上报的固定 9挡/2h 或退出除螨回退的默认 9挡/12h
         let shouldIgnoreMiteGearAndTimeReport = (draft.mode == .miteRemoval)
             || isExitingMiteRestoringState.contains(deviceID)
             || hardwareJustExitedMiteRemoval
 
         if hardwareJustExitedMiteRemoval && !isExitingMiteRestoringState.contains(deviceID) {
-            let restoreLeft = draft.gearLeft
-            let restoreRight = draft.gearRight
+            let restoreLeft = draft.savedGearLeft
+            let restoreRight = draft.savedGearRight
             let restoreClose = draft.timeCloseHours
             isExitingMiteRestoringState.insert(deviceID)
             Task { @MainActor [weak self] in

@@ -948,6 +948,8 @@ public struct DeviceControlView: View {
 }
 
 /// 独立抽离的底部悬浮液态玻璃控制坞（隔离重绘作用域：展开/收起时绝不触发上方 List 重排掉帧）
+/// - 左右外边距严格采用 `20pt`，确保左侧「关闭/开启电热毯」按钮距屏幕左边缘与顶部大卡片完全对齐
+/// - 三个按钮间距恒为 `10pt`，内部高度统一锁定为 `28pt`（加上系统 `.glass` / `.glassProminent` 胶囊内衬后上下总高度 100% 一致）
 private struct ControlFloatingDockView: View {
     @ObservedObject var bleManager: BlanketBLEManager
     let deviceID: UUID
@@ -955,13 +957,15 @@ private struct ControlFloatingDockView: View {
     let dominantGearColor: Color
     let isCollapsed: Bool
 
+    private let unifiedInnerHeight: CGFloat = 28
+
     var body: some View {
         HStack(spacing: 10) {
             if isCollapsed {
                 Spacer(minLength: 0)
             }
 
-            // 1. 开关电热毯悬浮按钮
+            // 1. 开关电热毯悬浮按钮（左边缘与顶部大卡片 20pt 严格对齐）
             Button {
                 Task { @MainActor in
                     await bleManager.setPower(isOn: !device.isOn, for: deviceID)
@@ -969,7 +973,7 @@ private struct ControlFloatingDockView: View {
             } label: {
                 HStack(spacing: isCollapsed ? 0 : 6) {
                     Image(systemName: "power")
-                        .font(.title3.weight(.semibold))
+                        .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(device.isOn ? Color.white : Color.primary)
                     if !isCollapsed {
                         Text(device.isOn ? "关闭电热毯" : "开启电热毯")
@@ -979,8 +983,8 @@ private struct ControlFloatingDockView: View {
                     }
                 }
                 .frame(maxWidth: isCollapsed ? nil : .infinity)
-                .padding(.vertical, isCollapsed ? 6 : 4)
-                .padding(.horizontal, isCollapsed ? 6 : 8)
+                .frame(width: isCollapsed ? unifiedInnerHeight : nil, height: unifiedInnerHeight)
+                .padding(.horizontal, isCollapsed ? 0 : 6)
             }
             .buttonStyle(.glassProminent)
             .buttonBorderShape(.capsule)
@@ -988,7 +992,7 @@ private struct ControlFloatingDockView: View {
             .sensoryFeedback(.impact(weight: .heavy), trigger: device.isOn)
             .accessibilityLabel(device.isOn ? "关闭电热毯" : "开启电热毯")
 
-            // 2. 切换除螨模式悬浮按钮
+            // 2. 切换除螨模式悬浮按钮（与左、右按钮间距及上下高度严格一致）
             Button {
                 let nextMode: BlanketHeatingMode = (device.mode == .miteRemoval) ? .normal : .miteRemoval
                 Task { @MainActor in
@@ -997,7 +1001,7 @@ private struct ControlFloatingDockView: View {
             } label: {
                 HStack(spacing: isCollapsed ? 0 : 6) {
                     Image(systemName: "sparkles")
-                        .font(.title3)
+                        .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle((device.isOn && device.mode == .miteRemoval) ? Color.red : Color.primary)
                     if !isCollapsed {
                         Text(device.mode == .miteRemoval ? "除螨中" : "除螨")
@@ -1006,8 +1010,8 @@ private struct ControlFloatingDockView: View {
                             .lineLimit(1)
                     }
                 }
-                .padding(.vertical, isCollapsed ? 6 : 4)
-                .padding(.horizontal, isCollapsed ? 6 : 8)
+                .frame(width: isCollapsed ? unifiedInnerHeight : nil, height: unifiedInnerHeight)
+                .padding(.horizontal, isCollapsed ? 0 : 8)
             }
             .buttonStyle(.glass)
             .buttonBorderShape(.capsule)
@@ -1016,7 +1020,7 @@ private struct ControlFloatingDockView: View {
             .opacity(device.isOn ? 1.0 : 0.45)
             .accessibilityLabel("切换除螨模式")
 
-            // 3. 一键切换双区同步液态玻璃圆钮
+            // 3. 一键切换双区同步液态玻璃按钮（采用 .capsule 边框与相同 28ptx28pt 内核尺寸，确保上下高度与前两个按钮 100% 对齐）
             Button {
                 withAnimation(.easeInOut(duration: 0.25)) {
                     let current = device.syncDualZones
@@ -1024,7 +1028,7 @@ private struct ControlFloatingDockView: View {
                 }
             } label: {
                 Image(systemName: device.syncDualZones ? "link.circle.fill" : "rectangle.split.2x1")
-                    .font(.title3)
+                    .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(
                         LiquidGlassTheme.iconColor(
                             for: .dualZone,
@@ -1033,13 +1037,13 @@ private struct ControlFloatingDockView: View {
                             gear: device.gearLeft
                         )
                     )
-                    .padding(isCollapsed ? 6 : 4)
+                    .frame(width: unifiedInnerHeight, height: unifiedInnerHeight)
             }
             .buttonStyle(.glass)
-            .buttonBorderShape(.circle)
+            .buttonBorderShape(.capsule)
             .accessibilityLabel("切换双温区同步")
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 20)
         .padding(.top, 6)
         .padding(.bottom, 8)
     }
